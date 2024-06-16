@@ -1,0 +1,11 @@
+{
+  "profiles": {
+    "MovieTracker.Backend": {
+      "commandName": "Project",
+      "commandLineArgs": "--port 7187",
+      "environmentVariables": {
+        "VaultUri": "https://yh5ax4ws5lr3k-movie-trac.vault.azure.net/"
+      }
+    }
+  }
+}

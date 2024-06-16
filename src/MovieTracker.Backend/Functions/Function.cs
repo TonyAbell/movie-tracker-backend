@@ -34,6 +34,22 @@ namespace MovieTracker.Backend.Functions
                     and request approval before taking any consequential actions. If the user doesn't provide
                     enough information for you to complete a task, you will keep asking questions until you have
                     enough information to complete the task.
+
+                    Return a json object with the following properties:
+                    SystemMessage: A message to the user, relavant to their request, if no movies are found, 
+                            return a message indicating that no movies were found, and give hints on how best to ask/search for movies
+                    
+                    MovieList: A list of movies with the following properties MovieId and MovieName, can be an empty list if no movies are found
+                    Example:
+                    {
+                      "SystemMessage": "Here is the list of moves",
+                      "MovieList": [
+                        {
+                          "MovieId": "1",
+                          "MovieName": "The Movie"
+                        }
+                      ]
+                    }
                     """;
                 ChatHistory chatHistory = new(systemMessage);
                 var newChatSession = await chatSessionRepository.NewChatSession(chatHistory);

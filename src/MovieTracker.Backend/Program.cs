@@ -14,6 +14,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
 using Microsoft.KernelMemory;
 using MovieTracker.Backend;
+using MovieTracker.Backend.Prompts;
 
 var serviceName = "movie-tracker-backend";
 var serviceVersion = "1.0.0";
@@ -78,9 +79,13 @@ var host = new HostBuilder()
 
             var kernelBuilder = Kernel.CreateBuilder();
             kernelBuilder.Services.AddLogging();
+            var configuration = serviceProvider.GetRequiredService<IConfiguration>();
+            kernelBuilder.Services.AddSingleton(configuration);
             IHttpClientFactory httpClientFactory = serviceProvider.GetRequiredService<IHttpClientFactory>();
             var httpClient = httpClientFactory.CreateClient("HttpClient");
             kernelBuilder.AddOpenAIChatCompletion(openAIOptions.TextModel, openAIOptions.APIKey, httpClient: httpClient);
+            kernelBuilder.Plugins.AddFromType<TheMovieDBKernelFunctions>();
+            //kernelBuilder.Plugins.AddFromType<ChatPlanner>();
             var kernel = kernelBuilder.Build();
             return kernel;
 

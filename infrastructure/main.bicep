@@ -2,6 +2,8 @@
 param location string = resourceGroup().location
 @secure()
 param open_ai_api_key string
+@secure()
+param the_movie_db_api_key string
 param adminPrincipalIds array = []
 module KeyVaultModule 'key-vault.bicep' = {
   name: 'KeyVault_Deploy'

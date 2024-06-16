@@ -2,6 +2,8 @@ param location string = resourceGroup().location
 param sku string = 'Standard'
 @secure()
 param open_ai_api_key string
+@secure()
+param the_movie_db_api_key string
 param adminPrincipalIds array = []
 var uniqueSuffix = uniqueString(resourceGroup().id)
 var vaultName = '${uniqueSuffix}-movie-trac'
@@ -41,11 +43,21 @@ resource key 'Microsoft.KeyVault/vaults/keys@2023-07-01' = {
 }
 
 
-resource secretHoneycombKey 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
+resource secretOpenApiKey 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
   parent: keyvaultDeployment
   name: 'OpenAi--Api-Key'
   properties: {
     value:  open_ai_api_key
+  }
+}
+
+
+
+resource secretTheMovieDbApiKey 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
+  parent: keyvaultDeployment
+  name: 'TheMovieDb--Api-Key'
+  properties: {
+    value:  the_movie_db_api_key
   }
 }
 

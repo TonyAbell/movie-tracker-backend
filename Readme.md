@@ -1,17 +1,38 @@
 # Movie Tracker Backend
 
 ## Purpose
-This project serves as the backend for a Movie Catalog application, providing a chat-based interface for movie search and management.
+
+This project serves as the backend for a Movie Catalog application, providing a chat-based interface for movie search and management. This is a semantic chat interface over The Movie DB Rest API.
+
+The Movie DB Rest API offers various endpoints for searching:
+- **Genre List**: [Genre Movie List](https://developer.themoviedb.org/reference/genre-movie-list)
+- **Search Person**: [Search Person](https://developer.themoviedb.org/reference/search-person)
+- **Search Movie**: [Search Movie](https://developer.themoviedb.org/reference/search-movie)
+
+A user may want to perform a complex query such as:
+- "What action movies in the 90s did the main actor also star in a comedy with Meg Ryan in the 80s?"
+- "List all sci-fi movies directed by Steven Spielberg that were released after 2000."
+- "Find movies where Leonardo DiCaprio and Kate Winslet acted together, in the last 10 years"
+- "Find movies in the 'Adventure' genre that were released in the 1980s that had low ratings starring Tom Cruise."
+- "What genre of movies did Tom Hanks act in the 90s?"
+- "Show me horror movies released in the last five years with a rating above 7.0, staring any one who costared with Johnny Depp in the 2000s."
+- "Find movies where Tom Hanks and Julia Roberts both appear that were released in the 90s and where comedies"
+
+These queries would require several sub-queries or a very complex UI to express with UI controls. Enabling a semantic chat interface allows the user to express their intent naturally, allowing the chat agent to construct the necessary queries and present the results in a clear and concise response.
 
 ## Table of Contents
+
 - [Infrastructure](#infrastructure)
 - [How to Use](#how-to-use)
 - [Prompts](#prompts)
 
+
 ## Infrastructure
+
 The infrastructure for the Movie Tracker Backend is managed using Bicep scripts, which automate the deployment of the necessary Azure resources.
 
 ### Deployment Instructions
+
 1. **Install Azure CLI**: Ensure you have the Azure CLI installed on your machine. You can download it from [Azure CLI](https://docs.microsoft.com/en-us/cli/azure/install-azure-cli).
 2. **Login to Azure**: Run `az login` to authenticate your Azure account.
 3. **Navigate to the Infrastructure Directory**: 

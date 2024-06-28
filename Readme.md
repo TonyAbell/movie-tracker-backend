@@ -50,7 +50,7 @@ The infrastructure for the Movie Tracker Backend is managed using Bicep scripts,
     - Replace `<your-email>`  with the actual values. Collect these object IDs into a list format like `["<objectId1>"]`.
 6. **Deploy Resources**: Execute the Bicep scripts to deploy the Azure resources.
     ```sh
-    az deployment group create --name MyDeployment --resource-group movie-tracker-rg --template-file ./key-vault.bicep --parameters adminPrincipalIds="['<objectId1>']" open_ai_api_key='<yourOpenAIKey>' the_movie_db_api_key='<yourMovieDbKey>'
+    az deployment group create --name MyDeployment --resource-group movie-tracker-rg --template-file ./main.bicep --parameters adminPrincipalIds="['<objectId1>']" open_ai_api_key='<yourOpenAIKey>' the_movie_db_api_key='<yourMovieDbKey>'
     ```
 
 By following these instructions, you will set up the necessary infrastructure for the Movie Tracker Backend, including obtaining and configuring the required API keys for OpenAI and The Movie Database, and setting up Azure Entra RBAC access.

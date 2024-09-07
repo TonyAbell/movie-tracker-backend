@@ -6,6 +6,8 @@ using Microsoft.SemanticKernel.ChatCompletion;
 using Microsoft.SemanticKernel.Connectors.OpenAI;
 using Microsoft.SemanticKernel;
 using OpenTelemetry.Trace;
+using System.Text.Json.Serialization;
+using OpenAI.Chat;
 
 namespace MovieTracker.Backend.Functions
 {
@@ -14,8 +16,57 @@ namespace MovieTracker.Backend.Functions
     {
         public string Input { get; set; } = string.Empty;
     }
-    public record ChatMessageRecord(string Role, string Text);
-    public record ChatMessageResponse(List<ChatMessageRecord> Messages);
+
+    public record MovieItem(string MovieId, string MovieName);
+    public record LLMResponse(string SystemMessage, List<MovieItem> MovieList);
+    
+
+    //public record ChatMessageRecord(string Role, string Text);
+
+    [JsonPolymorphic(TypeDiscriminatorPropertyName = nameof(role))]
+    [JsonDerivedType(typeof(UserChatMessage), typeDiscriminator: "user")]
+    [JsonDerivedType(typeof(AssistantChatMessage), typeDiscriminator: "assistant")]
+    public abstract class ChatMessage
+    {
+
+     
+        public abstract string role { get; }
+        public abstract string Text { get; }    
+    }
+
+    public class UserChatMessage : ChatMessage
+    {
+        [JsonIgnore]
+        public override string role => "user";        
+        public override string Text { get;  }
+
+        public UserChatMessage( string text)
+        {
+        
+            Text = text;
+        }
+    }
+
+  
+
+    public class AssistantChatMessage : ChatMessage
+    {
+        [JsonIgnore]
+        public override string role => "assistant";
+        public override string Text { get; }
+
+        public List<MovieItem> MovieList { get; set; } = new List<MovieItem>(); 
+        public AssistantChatMessage(string text, List<MovieItem> movieList)
+        {
+
+            Text = text;
+            MovieList = movieList;
+        }
+    }
+
+
+    public record ChatMessageResponse(List<ChatMessage> Messages);
+
 
     public class Function(Kernel kernel, ChatSessionRepository chatSessionRepository, ILogger<Function> logger, Tracer tracer)
     {
@@ -90,7 +141,6 @@ namespace MovieTracker.Backend.Functions
                 OpenAIPromptExecutionSettings openAIPromptExecutionSettings = new()
                 {
                     ToolCallBehavior = ToolCallBehavior.AutoInvokeKernelFunctions,
-
                 };
                 var result = await chatCompletionService.GetChatMessageContentsAsync(
                    chatMessages,
@@ -116,35 +166,68 @@ namespace MovieTracker.Backend.Functions
                 }
 
 
-                var responseMessages = new List<ChatMessageRecord>();
+                var responseMessages = new List<ChatMessage>();
                 foreach (var messages in chatMessages)
                 {
-                    string role = "";
+                    //ChatMessage chatMessage;
+                    //string role = "";
                     var text = messages.ToString();
-                    if (messages.Role == AuthorRole.Assistant)
+                    if (messages.Role == AuthorRole.Assistant && !String.IsNullOrEmpty(text))
                     {
-                        role = "assistant";
+                        //role = "assistant";
+                        //todo check to see if text contains the string json.. remove the json string
+
+                        // remove string json if it exists from the text
+                        // sometimes the there is ```json in the front of the text
+                        // sometimes there is ``` at the end of the text
+                        // need to remove these strings
+
+                        text = text.Replace("```json", "");
+                        text = text.Replace("```", "");
+
+
+
+
+                        System.Text.Json.JsonDocument doc = System.Text.Json.JsonDocument.Parse(text);
+
+                        var root = doc.RootElement;
+                        var systemMessage = root.GetProperty("SystemMessage").GetString();
+                        var movieList = root.GetProperty("MovieList").EnumerateArray();
+                        List<MovieItem> movieItems = new List<MovieItem>();
+                        foreach (var movie in movieList)
+                        {
+                            var movieId = movie.GetProperty("MovieId").GetString();
+                            var movieName = movie.GetProperty("MovieName").GetString();
+                            movieItems.Add(new MovieItem(movieId, movieName));
+                        }
+
+                        AssistantChatMessage assistantChatMessage = new AssistantChatMessage(systemMessage, movieItems);
+                        
+
+                        responseMessages.Add(assistantChatMessage);
 
                     }
-                    if (messages.Role == AuthorRole.User)
+                    if (messages.Role == AuthorRole.User && !String.IsNullOrEmpty(text))
                     {
-                        role = "user";
+                        //role = "user";
+                        UserChatMessage userChatMessage = new UserChatMessage(text);
+                        responseMessages.Add(userChatMessage);
                     }
                     if (messages.Role == AuthorRole.Tool)
                     {
-                        role = "user";
+                        //role = "user";
                         text = "";
                     }
                     if (messages.Role == AuthorRole.System)
                     {
-                        role = "system";
+                        //role = "system";
                         text = "";
                     }
 
-                    if (!string.IsNullOrEmpty(text))
-                    {
-                        responseMessages.Add(new ChatMessageRecord(role, text));
-                    }
+                    //if (!string.IsNullOrEmpty(text))
+                    //{
+                    //    responseMessages.Add(new ChatMessageRecord(role, text));
+                    //}
                 }
 
                 await chatSessionRepository.UpdateChatSession(chatId, chatMessages);

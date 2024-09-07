@@ -396,3 +396,5 @@ FodyWeavers.xsd
 
 # JetBrains Rider
 *.sln.iml
+/src/MovieTracker.Backend/Properties/ServiceDependencies/yh5ax4ws5lr3k-func-movie-tracker - Zip Deploy
+/src/MovieTracker.Backend/Properties/serviceDependencies.yh5ax4ws5lr3k-func-movie-tracker - Zip Deploy.json

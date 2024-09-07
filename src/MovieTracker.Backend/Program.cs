@@ -43,6 +43,7 @@ var host = new HostBuilder()
         services.ConfigureFunctionsApplicationInsights();
         services.AddHttpClient("HttpClient")
                 .AddStandardResilienceHandler();
+    
         services.AddSingleton(TracerProvider.Default.GetTracer(serviceName, serviceVersion));
         services.AddSingleton<CosmosClient>(serviceProvider =>
         {

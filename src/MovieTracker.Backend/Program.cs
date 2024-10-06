@@ -15,9 +15,14 @@ using Microsoft.SemanticKernel;
 using Microsoft.KernelMemory;
 using MovieTracker.Backend;
 using MovieTracker.Backend.Prompts;
+using Azure.Monitor.OpenTelemetry.Exporter;
+using OpenTelemetry.Logs;
 
 var serviceName = "movie-tracker-backend";
 var serviceVersion = "1.0.0";
+
+AppContext.SetSwitch("Microsoft.SemanticKernel.Experimental.GenAI.EnableOTelDiagnosticsSensitive", true);
+
 var host = new HostBuilder()
     .ConfigureAppConfiguration((context, config) =>
     {
@@ -37,13 +42,25 @@ var host = new HostBuilder()
 
     })
     .ConfigureFunctionsWebApplication()
+    .ConfigureLogging(logging =>
+    {
+        logging.Services.Configure<LoggerFilterOptions>(options =>
+        {
+            LoggerFilterRule defaultRule = options.Rules.FirstOrDefault(rule => rule.ProviderName
+                == "Microsoft.Extensions.Logging.ApplicationInsights.ApplicationInsightsLoggerProvider");
+            if (defaultRule is not null)
+            {
+                options.Rules.Remove(defaultRule);
+            }
+        });
+    })
     .ConfigureServices((context, services) =>
     {
         services.AddApplicationInsightsTelemetryWorkerService();
         services.ConfigureFunctionsApplicationInsights();
         services.AddHttpClient("HttpClient")
                 .AddStandardResilienceHandler();
-    
+
         services.AddSingleton(TracerProvider.Default.GetTracer(serviceName, serviceVersion));
         services.AddSingleton<CosmosClient>(serviceProvider =>
         {
@@ -79,44 +96,58 @@ var host = new HostBuilder()
             };
 
             var kernelBuilder = Kernel.CreateBuilder();
-            kernelBuilder.Services.AddLogging();
+            var loggerFactory = serviceProvider.GetRequiredService<ILoggerFactory>();
+            kernelBuilder.Services.AddLogging(builder =>
+            {
+                builder.AddOpenTelemetry(options =>
+                {
+                    options.SetResourceBuilder(ResourceBuilder.CreateDefault());
+                    options.AddAzureMonitorLogExporter(options => options.ConnectionString = context.Configuration["APPLICATIONINSIGHTS-CONNECTION-STRING"]);
+                    options.IncludeFormattedMessage = true;
+                    options.IncludeScopes = true;
+                });
+                builder.AddFilter("Microsoft", LogLevel.Warning);
+                builder.AddFilter("Microsoft.SemanticKernel", LogLevel.Information);
+                builder.SetMinimumLevel(LogLevel.Information);
+            });
             var configuration = serviceProvider.GetRequiredService<IConfiguration>();
             kernelBuilder.Services.AddSingleton(configuration);
             IHttpClientFactory httpClientFactory = serviceProvider.GetRequiredService<IHttpClientFactory>();
             var httpClient = httpClientFactory.CreateClient("HttpClient");
             kernelBuilder.AddOpenAIChatCompletion(openAIOptions.TextModel, openAIOptions.APIKey, httpClient: httpClient);
             kernelBuilder.Plugins.AddFromType<TheMovieDBKernelFunctions>();
+
             //kernelBuilder.Plugins.AddFromType<ChatPlanner>();
             var kernel = kernelBuilder.Build();
             return kernel;
 
         });
         services.AddOpenTelemetry()
-                 .WithTracing((tracing) =>
+                 .WithTracing((builder) =>
                  {
-                     tracing.AddSource(serviceName)
+                     builder.AddSource(serviceName)
+                            .AddSource("Microsoft.SemanticKernel*")
                             .SetResourceBuilder(ResourceBuilder.CreateDefault()
                             .AddService(serviceName: serviceName, serviceVersion: serviceVersion))
-                            .AddAspNetCoreInstrumentation();
+                            .AddAspNetCoreInstrumentation()
+                            .AddHttpClientInstrumentation()
+                            .AddAzureMonitorTraceExporter(options => options.ConnectionString = context.Configuration["APPLICATIONINSIGHTS-CONNECTION-STRING"]);
+                     //.AddAzureMonitorTraceExporter(configure =>
+                     //{
+                     //    configure.ConnectionString = context.Configuration["APPLICATIONINSIGHTS-CONNECTION-STRING"];
+                     //});
                  })
-               .UseFunctionsWorkerDefaults()
-               .UseAzureMonitor(configure =>
+               .WithLogging(builder =>
                {
-                   configure.ConnectionString = context.Configuration["APPLICATIONINSIGHTS-CONNECTION-STRING"];
-               });
-    })
-    .ConfigureLogging(logging =>
-    {
-        logging.Services.Configure<LoggerFilterOptions>(options =>
-        {
-            LoggerFilterRule defaultRule = options.Rules.FirstOrDefault(rule => rule.ProviderName
-                == "Microsoft.Extensions.Logging.ApplicationInsights.ApplicationInsightsLoggerProvider");
-            if (defaultRule is not null)
-            {
-                options.Rules.Remove(defaultRule);
-            }
-        });
-    })
+
+               })
+               .UseFunctionsWorkerDefaults();
+               //.UseAzureMonitor(configure =>
+               //{
+               //    configure.ConnectionString = context.Configuration["APPLICATIONINSIGHTS-CONNECTION-STRING"];
+               //});
+        })
+       
     .Build();
 
 host.Run();

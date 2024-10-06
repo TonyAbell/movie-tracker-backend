@@ -8,6 +8,8 @@ using Microsoft.SemanticKernel;
 using OpenTelemetry.Trace;
 using System.Text.Json.Serialization;
 using OpenAI.Chat;
+using System.Text.Json;
+using static MovieTracker.Backend.Prompts.TheMovieDBKernelFunctions;
 
 namespace MovieTracker.Backend.Functions
 {
@@ -67,6 +69,17 @@ namespace MovieTracker.Backend.Functions
 
     public record ChatMessageResponse(List<ChatMessage> Messages);
 
+    public class MovieListResponse
+    {
+        public string SystemMessage { get; set; }
+        public List<MovieListItem> MovieList { get; set; } 
+    }
+
+    public class MovieListItem 
+    {
+        public string MovieId { get; set; }
+        public string MovieName { get; set; }
+    }
 
     public class Function(Kernel kernel, ChatSessionRepository chatSessionRepository, ILogger<Function> logger, Tracer tracer)
     {
@@ -81,19 +94,23 @@ namespace MovieTracker.Backend.Functions
             {
 
                 var systemMessage = """
-                    You are a friendly assistant who likes to follow the rules. You will complete required steps
-                    and request approval before taking any consequential actions. If the user doesn't provide
-                    enough information for you to complete a task, you will keep asking questions until you have
-                    enough information to complete the task.
+                    You are a friendly assistant who follows instructions strictly. Your response must always be a JSON object and nothing else.
+                    The JSON object must contain the following properties:
 
-                    Return a json object with the following properties:
-                    SystemMessage: A message to the user, relavant to their request, if no movies are found, 
-                            return a message indicating that no movies were found, and give hints on how best to ask/search for movies
-                    
-                    MovieList: A list of movies with the following properties MovieId and MovieName, can be an empty list if no movies are found
-                    Example:
+                    - "SystemMessage": A string providing a relevant message to the user. If no movies are found, indicate this and provide hints on how to ask/search for movies.
+                    - "MovieList": An array of objects, each having:
+                      - "MovieId": A string representing the movie's identifier.
+                      - "MovieName": A string representing the movie's name.
+
+                    If you cannot find any movies, return the following JSON object:
                     {
-                      "SystemMessage": "Here is the list of moves",
+                      "SystemMessage": "No movies were found. Try searching with different keywords.",
+                      "MovieList": []
+                    }
+
+                    Otherwise, return an object like this:
+                    {
+                      "SystemMessage": "Here is the list of movies:",
                       "MovieList": [
                         {
                           "MovieId": "1",
@@ -101,6 +118,7 @@ namespace MovieTracker.Backend.Functions
                         }
                       ]
                     }
+                    Remember to respond only with a JSON object that follows this structure.
                     """;
                 ChatHistory chatHistory = new(systemMessage);
                 var newChatSession = await chatSessionRepository.NewChatSession(chatHistory);
@@ -140,8 +158,13 @@ namespace MovieTracker.Backend.Functions
 
                 OpenAIPromptExecutionSettings openAIPromptExecutionSettings = new()
                 {
-                    ToolCallBehavior = ToolCallBehavior.AutoInvokeKernelFunctions,
+                    ToolCallBehavior = ToolCallBehavior.AutoInvokeKernelFunctions,                  
                 };
+
+#pragma warning disable SKEXP0010 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
+                openAIPromptExecutionSettings.ResponseFormat = typeof(MovieListResponse);
+#pragma warning restore SKEXP0010 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
+
                 var result = await chatCompletionService.GetChatMessageContentsAsync(
                    chatMessages,
                    executionSettings: openAIPromptExecutionSettings,
@@ -155,8 +178,6 @@ namespace MovieTracker.Backend.Functions
                     {
                         role = "assistant";
 
-                        //chatMessages.Add(content);
-
                         chatMessages.AddAssistantMessage(text);
                     }
                     if (content.Role == AuthorRole.User)
@@ -168,43 +189,45 @@ namespace MovieTracker.Backend.Functions
 
                 var responseMessages = new List<ChatMessage>();
                 foreach (var messages in chatMessages)
-                {
-                    //ChatMessage chatMessage;
-                    //string role = "";
+                {                   
                     var text = messages.ToString();
                     if (messages.Role == AuthorRole.Assistant && !String.IsNullOrEmpty(text))
-                    {
-                        //role = "assistant";
-                        //todo check to see if text contains the string json.. remove the json string
-
-                        // remove string json if it exists from the text
-                        // sometimes the there is ```json in the front of the text
-                        // sometimes there is ``` at the end of the text
-                        // need to remove these strings
-
+                    {                       
                         text = text.Replace("```json", "");
                         text = text.Replace("```", "");
-
-
-
-
-                        System.Text.Json.JsonDocument doc = System.Text.Json.JsonDocument.Parse(text);
-
-                        var root = doc.RootElement;
-                        var systemMessage = root.GetProperty("SystemMessage").GetString();
-                        var movieList = root.GetProperty("MovieList").EnumerateArray();
-                        List<MovieItem> movieItems = new List<MovieItem>();
-                        foreach (var movie in movieList)
+                        try
                         {
-                            var movieId = movie.GetProperty("MovieId").GetString();
-                            var movieName = movie.GetProperty("MovieName").GetString();
-                            movieItems.Add(new MovieItem(movieId, movieName));
+                            // Validate JSON format
+                            System.Text.Json.JsonDocument doc = System.Text.Json.JsonDocument.Parse(text);
+                            var root = doc.RootElement;
+                            var systemMessage = root.GetProperty("SystemMessage").GetString();
+                            JsonElement movieList;
+                            List<MovieItem> movieItems = new List<MovieItem>();
+                            if (root.TryGetProperty("MovieList", out movieList))
+                            {
+                                var movieListArray = movieList.EnumerateArray();
+
+                                foreach (var movie in movieListArray)
+                                {
+                                    var movieId = movie.GetProperty("MovieId").GetString();
+                                    var movieName = movie.GetProperty("MovieName").GetString();
+                                    movieItems.Add(new MovieItem(movieId, movieName));
+                                }
+                            }
+                            AssistantChatMessage assistantChatMessage = new AssistantChatMessage(systemMessage, movieItems);
+                            responseMessages.Add(assistantChatMessage);
+                        }
+                        catch (JsonException)
+                        {
+                            // If invalid, prompt the assistant again or rephrase the last message to get a structured response
+                            // Or append "Please respond with a properly formatted JSON" to the previous user message
+                            List<MovieItem> movieItems = new List<MovieItem>();
+                            var systemMessage = "No movies were found";
+                            AssistantChatMessage assistantChatMessage = new AssistantChatMessage(systemMessage, movieItems);
+                            responseMessages.Add(assistantChatMessage);
                         }
 
-                        AssistantChatMessage assistantChatMessage = new AssistantChatMessage(systemMessage, movieItems);
-                        
-
-                        responseMessages.Add(assistantChatMessage);
+                      
 
                     }
                     if (messages.Role == AuthorRole.User && !String.IsNullOrEmpty(text))
@@ -222,12 +245,7 @@ namespace MovieTracker.Backend.Functions
                     {
                         //role = "system";
                         text = "";
-                    }
-
-                    //if (!string.IsNullOrEmpty(text))
-                    //{
-                    //    responseMessages.Add(new ChatMessageRecord(role, text));
-                    //}
+                    }                 
                 }
 
                 await chatSessionRepository.UpdateChatSession(chatId, chatMessages);

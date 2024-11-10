@@ -10,6 +10,10 @@ using System.Text.Json.Serialization;
 using OpenAI.Chat;
 using System.Text.Json;
 using static MovieTracker.Backend.Prompts.TheMovieDBKernelFunctions;
+using Microsoft.Extensions.Caching.Distributed;
+using Microsoft.AspNetCore.DataProtection.KeyManagement;
+using TMDbLib.Client;
+using Microsoft.Extensions.Configuration;
 
 namespace MovieTracker.Backend.Functions
 {
@@ -18,6 +22,26 @@ namespace MovieTracker.Backend.Functions
     {
         public string Input { get; set; } = string.Empty;
     }
+//    export interface TmdbMovieModel
+//    {
+//        poster_path: string;
+//    adult: boolean;
+//    overview: string;
+//    release_date: string;
+//    genre_ids: number[];
+//    id: string;
+//    original_title: string;
+//    original_language: string;
+//    title: string;
+//    backdrop_path: string;
+//    popularity: number;
+//    vote_count: number;
+//    video: boolean;
+//    vote_average: number;
+//    favorite: boolean;
+//}
+
+    public record MovieViewModel(string PosterPath, bool Adult, string Overview, DateTime? ReleaseDate, List<int> GenreIds, string Id, string OriginalTitle, string OriginalLanguage, string Title, string BackdropPath, double? Popularity, int VoteCount, bool Video, double VoteAverage, bool Favorite);
 
     public record MovieItem(string MovieId, string MovieName);
     public record LLMResponse(string SystemMessage, List<MovieItem> MovieList);
@@ -57,8 +81,8 @@ namespace MovieTracker.Backend.Functions
         public override string role => "assistant";
         public override string Text { get; }
 
-        public List<MovieItem> MovieList { get; set; } = new List<MovieItem>(); 
-        public AssistantChatMessage(string text, List<MovieItem> movieList)
+        public List<MovieViewModel> MovieList { get; set; } = new List<MovieViewModel>(); 
+        public AssistantChatMessage(string text, List<MovieViewModel> movieList)
         {
 
             Text = text;
@@ -81,9 +105,10 @@ namespace MovieTracker.Backend.Functions
         public string MovieName { get; set; }
     }
 
-    public class Function(Kernel kernel, ChatSessionRepository chatSessionRepository, ILogger<Function> logger, Tracer tracer)
+    public class Function(Kernel kernel, ChatSessionRepository chatSessionRepository,IDistributedCache cache, IConfiguration configuration,ILogger<Function> logger, Tracer tracer)
     {
 
+        private readonly string apiKey = configuration["TheMovieDb:Api-Key"] ?? throw new ArgumentNullException("Missing The Movice Db Api Key");
 
 
         [Function("Chat-Start")]
@@ -130,19 +155,61 @@ namespace MovieTracker.Backend.Functions
                 return new BadRequestObjectResult(ex.Message);
             }
         }
+        private async Task ProcessMovieAsync(JsonElement movie, List<MovieViewModel> movieItems, TMDbClient client)
+        {
+            var movieId = movie.GetProperty("MovieId").GetString();
+            if (movieId == null)
+            {
+                logger.LogWarning("MovieId is null");
+                return;
+            }
 
+            var dataInBytes = await cache.GetAsync(movieId);
+            if (dataInBytes != null)
+            {
+                var movieViewModel = JsonSerializer.Deserialize<MovieViewModel>(dataInBytes);
+                if (movieViewModel != null)
+                {
+                    lock (movieItems) // Thread-safe access to shared list
+                    {
+                        movieItems.Add(movieViewModel);
+                    }
+                }
+            }
+            else
+            {
+                var tmdbMovie = await client.GetMovieAsync(int.Parse(movieId));
+                var movieViewModel = new MovieViewModel(
+                    tmdbMovie.PosterPath, tmdbMovie.Adult, tmdbMovie.Overview, tmdbMovie.ReleaseDate,
+                    tmdbMovie.Genres.Select(g => g.Id).ToList(), movieId,
+                    tmdbMovie.OriginalTitle, tmdbMovie.OriginalLanguage, tmdbMovie.Title,
+                    tmdbMovie.BackdropPath, tmdbMovie.Popularity, tmdbMovie.VoteCount,
+                    tmdbMovie.Video, tmdbMovie.VoteAverage, Favorite: false);
+
+                lock (movieItems) // Thread-safe access to shared list
+                {
+                    movieItems.Add(movieViewModel);
+                }
+
+                var movieViewModelBytes = JsonSerializer.SerializeToUtf8Bytes(movieViewModel);
+                await cache.SetAsync(movieId, movieViewModelBytes);
+            }
+        }
         [Function("Chat-Ask")]
         public async Task<IActionResult> Message(
-                     [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "chat/{chatId}/ask")] HttpRequest req, string chatId)
+    [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "chat/{chatId}/ask")] HttpRequest req,
+    string chatId)
         {
             using var activity = tracer.StartActiveSpan("movie-tracker-func.chat-ask");
             try
             {
+                TMDbClient client = new TMDbClient(apiKey);
                 var ask = await req.ReadFromJsonAsync<Ask>();
                 if (ask == null)
                 {
                     return new BadRequestObjectResult("Invalid request, missing ask object");
                 }
+
                 logger.LogDebug("Chat message received.");
                 var chatSession = await chatSessionRepository.GetChatSession(chatId);
                 var chatMessages = chatSession.ChatHistory;
@@ -151,106 +218,84 @@ namespace MovieTracker.Backend.Functions
                 {
                     return new BadRequestObjectResult("Chat not found");
                 }
+
                 chatMessages.AddUserMessage(ask.Input);
-
-
                 IChatCompletionService chatCompletionService = kernel.GetRequiredService<IChatCompletionService>();
 
                 OpenAIPromptExecutionSettings openAIPromptExecutionSettings = new()
                 {
-                    ToolCallBehavior = ToolCallBehavior.AutoInvokeKernelFunctions,                  
+                    ToolCallBehavior = ToolCallBehavior.AutoInvokeKernelFunctions,
+                   
                 };
-
 #pragma warning disable SKEXP0010 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
                 openAIPromptExecutionSettings.ResponseFormat = typeof(MovieListResponse);
 #pragma warning restore SKEXP0010 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
 
                 var result = await chatCompletionService.GetChatMessageContentsAsync(
-                   chatMessages,
-                   executionSettings: openAIPromptExecutionSettings,
-                   kernel: kernel);
+                    chatMessages,
+                    executionSettings: openAIPromptExecutionSettings,
+                    kernel: kernel);
 
                 foreach (var content in result)
                 {
-                    string role = "";
                     var text = content.ToString();
                     if (content.Role == AuthorRole.Assistant)
                     {
-                        role = "assistant";
-
                         chatMessages.AddAssistantMessage(text);
-                    }
-                    if (content.Role == AuthorRole.User)
-                    {
-                        role = "user";
                     }
                 }
 
-
                 var responseMessages = new List<ChatMessage>();
                 foreach (var messages in chatMessages)
-                {                   
+                {
                     var text = messages.ToString();
                     if (messages.Role == AuthorRole.Assistant && !String.IsNullOrEmpty(text))
-                    {                       
-                        text = text.Replace("```json", "");
-                        text = text.Replace("```", "");
+                    {
+                        text = text.Replace("```json", "").Replace("```", "");
+                        List<MovieViewModel> movieItems = new List<MovieViewModel>();
                         try
                         {
                             // Validate JSON format
                             System.Text.Json.JsonDocument doc = System.Text.Json.JsonDocument.Parse(text);
                             var root = doc.RootElement;
                             var systemMessage = root.GetProperty("SystemMessage").GetString();
-                            JsonElement movieList;
-                            List<MovieItem> movieItems = new List<MovieItem>();
-                            if (root.TryGetProperty("MovieList", out movieList))
+
+                            if (root.TryGetProperty("MovieList", out JsonElement movieList))
                             {
                                 var movieListArray = movieList.EnumerateArray();
+                                var tasks = new List<Task>();
 
+                                // Process each movie in parallel
                                 foreach (var movie in movieListArray)
                                 {
-                                    var movieId = movie.GetProperty("MovieId").GetString();
-                                    var movieName = movie.GetProperty("MovieName").GetString();
-                                    movieItems.Add(new MovieItem(movieId, movieName));
+                                    tasks.Add(ProcessMovieAsync(movie, movieItems, client));
                                 }
+
+                                await Task.WhenAll(tasks);
                             }
+
                             AssistantChatMessage assistantChatMessage = new AssistantChatMessage(systemMessage, movieItems);
                             responseMessages.Add(assistantChatMessage);
                         }
                         catch (JsonException)
                         {
-                            // If invalid, prompt the assistant again or rephrase the last message to get a structured response
-                            // Or append "Please respond with a properly formatted JSON" to the previous user message
-                            List<MovieItem> movieItems = new List<MovieItem>();
                             var systemMessage = "No movies were found";
                             AssistantChatMessage assistantChatMessage = new AssistantChatMessage(systemMessage, movieItems);
                             responseMessages.Add(assistantChatMessage);
                         }
-
-                      
-
                     }
+
                     if (messages.Role == AuthorRole.User && !String.IsNullOrEmpty(text))
                     {
-                        //role = "user";
                         UserChatMessage userChatMessage = new UserChatMessage(text);
                         responseMessages.Add(userChatMessage);
                     }
-                    if (messages.Role == AuthorRole.Tool)
-                    {
-                        //role = "user";
-                        text = "";
-                    }
-                    if (messages.Role == AuthorRole.System)
-                    {
-                        //role = "system";
-                        text = "";
-                    }                 
+
+                    // Handle other roles if necessary
                 }
 
                 await chatSessionRepository.UpdateChatSession(chatId, chatMessages);
                 var response = new ChatMessageResponse(responseMessages);
-
                 return new OkObjectResult(response);
             }
             catch (Exception ex)

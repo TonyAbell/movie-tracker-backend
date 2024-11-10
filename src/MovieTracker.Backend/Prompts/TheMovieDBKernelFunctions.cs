@@ -15,7 +15,7 @@ namespace MovieTracker.Backend.Prompts
     public class TheMovieDBKernelFunctions(IConfiguration configuration)
     {
         private readonly string apiKey = configuration["TheMovieDb:Api-Key"] ?? throw new ArgumentNullException("Missing The Movice Db Api Key");
-        public record MovieItem(string MovieId, string MovieName);
+        private record MovieItem(string MovieId, string MovieName);
 
         public record GenresItem(string GenreId, string GenreName);
         [KernelFunction]

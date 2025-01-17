@@ -88,6 +88,37 @@ namespace MovieTracker.Backend.Prompts
         }
 
         [KernelFunction]
+        [Description("Returns detailed information about a specific movie in a serialized format")]
+        [return: Description("Serialized JSON containing information about a specific movie")]
+        public async Task<string> DescribeMovie([Description("The movie ID of a specific movie")] string movieId)
+        {
+            TMDbClient client = new TMDbClient(apiKey);
+            var movie = await client.GetMovieAsync(int.Parse(movieId));
+
+            // Create an object to hold relevant movie data
+            var movieData = new
+            {
+                Title = movie.Title,
+                Overview = movie.Overview,
+                ReleaseDate = movie.ReleaseDate?.ToString("yyyy-MM-dd"),
+                Genres = movie.Genres.Select(g => g.Name).ToList(),
+                Runtime = movie.Runtime,
+                Tagline = movie.Tagline,
+                Rating = movie.VoteAverage,
+                Language = movie.OriginalLanguage,
+                Cast = (await client.GetMovieCreditsAsync(movie.Id))?.Cast.Take(5).Select(c => c.Name).ToList() // Top 5 cast members
+            };
+
+            // Serialize the movie data to JSON
+            string movieJson = JsonSerializer.Serialize(movieData, new JsonSerializerOptions
+            {
+                WriteIndented = true
+            });
+
+            return movieJson;
+        }
+
+        [KernelFunction]
         [Description("Discover movies based on various filters and sort options.")]
         [return: Description("A JSON list of movies with their properties such as MovieId, MovieName, and ReleaseDate.")]
         public async Task<string> DiscoverMovies(

@@ -129,7 +129,7 @@ namespace MovieTracker.Backend.Functions
 
                     If you cannot find any movies, return the following JSON object:
                     {
-                      "SystemMessage": "No movies were found. Try searching with different keywords.",
+                      "SystemMessage": "No movies were found. Try refining your search with more specific keywords, such as a genre, release year, or actor name. For example: 'action movies from 2020', 'comedy movies with Will Smith', or 'animated movies from the 90s'.",
                       "MovieList": []
                     }
 

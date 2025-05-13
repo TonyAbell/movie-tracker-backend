@@ -14,6 +14,7 @@ using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.AspNetCore.DataProtection.KeyManagement;
 using TMDbLib.Client;
 using Microsoft.Extensions.Configuration;
+using MovieTracker.Backend.Prompts;
 
 namespace MovieTracker.Backend.Functions
 {
@@ -91,12 +92,28 @@ namespace MovieTracker.Backend.Functions
     }
 
 
-    public record ChatMessageResponse(List<ChatMessage> Messages);
+    public record ChatMessageResponse(string? FunnyFact, List<ChatMessage> Messages);
+
+    public class ChatSession
+    {
+        public string Id { get; set; }
+        public ChatHistory ChatHistory { get; set; }
+        public string? FunnyFact { get; set; }  // Funny fact at the session level
+
+        public ChatSession(string id, ChatHistory chatHistory)
+        {
+            Id = id;
+            ChatHistory = chatHistory;
+            FunnyFact = null;
+        }
+    }
+
 
     public class MovieListResponse
     {
         public string SystemMessage { get; set; }
-        public List<MovieListItem> MovieList { get; set; } 
+        public List<MovieListItem> MovieList { get; set; }
+        public string FunnyFact { get; set; }
     }
 
     public class MovieListItem 
@@ -195,10 +212,11 @@ namespace MovieTracker.Backend.Functions
                 await cache.SetAsync(movieId, movieViewModelBytes);
             }
         }
+
         [Function("Chat-Ask")]
         public async Task<IActionResult> Message(
-    [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "chat/{chatId}/ask")] HttpRequest req,
-    string chatId)
+            [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "chat/{chatId}/ask")] HttpRequest req,
+            string chatId)
         {
             using var activity = tracer.StartActiveSpan("movie-tracker-func.chat-ask");
             try
@@ -219,17 +237,25 @@ namespace MovieTracker.Backend.Functions
                     return new BadRequestObjectResult("Chat not found");
                 }
 
+                var chatPlanner = new ChatPlanner(kernel);
+
+                string? funnyFact = await chatPlanner.GenerateFunnyFact(ask.Input);
+
+                if (funnyFact != null)
+                {
+                    chatSession.FunnyFact = funnyFact;
+                }
+
                 chatMessages.AddUserMessage(ask.Input);
                 IChatCompletionService chatCompletionService = kernel.GetRequiredService<IChatCompletionService>();
 
                 OpenAIPromptExecutionSettings openAIPromptExecutionSettings = new()
                 {
                     ToolCallBehavior = ToolCallBehavior.AutoInvokeKernelFunctions,
-                   
                 };
-#pragma warning disable SKEXP0010 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
+#pragma warning disable SKEXP0010
                 openAIPromptExecutionSettings.ResponseFormat = typeof(MovieListResponse);
-#pragma warning restore SKEXP0010 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
+#pragma warning restore SKEXP0010
 
                 var result = await chatCompletionService.GetChatMessageContentsAsync(
                     chatMessages,
@@ -253,9 +279,9 @@ namespace MovieTracker.Backend.Functions
                     {
                         text = text.Replace("```json", "").Replace("```", "");
                         List<MovieViewModel> movieItems = new List<MovieViewModel>();
+
                         try
                         {
-                            // Validate JSON format
                             System.Text.Json.JsonDocument doc = System.Text.Json.JsonDocument.Parse(text);
                             var root = doc.RootElement;
                             var systemMessage = root.GetProperty("SystemMessage").GetString();
@@ -265,7 +291,6 @@ namespace MovieTracker.Backend.Functions
                                 var movieListArray = movieList.EnumerateArray();
                                 var tasks = new List<Task>();
 
-                                // Process each movie in parallel
                                 foreach (var movie in movieListArray)
                                 {
                                     tasks.Add(ProcessMovieAsync(movie, movieItems, client));
@@ -290,12 +315,11 @@ namespace MovieTracker.Backend.Functions
                         UserChatMessage userChatMessage = new UserChatMessage(text);
                         responseMessages.Add(userChatMessage);
                     }
-
-                    // Handle other roles if necessary
                 }
 
-                await chatSessionRepository.UpdateChatSession(chatId, chatMessages);
-                var response = new ChatMessageResponse(responseMessages);
+                await chatSessionRepository.UpdateChatSession(chatId, chatMessages, chatSession.FunnyFact);
+
+                var response = new ChatMessageResponse(chatSession.FunnyFact, responseMessages);
                 return new OkObjectResult(response);
             }
             catch (Exception ex)
@@ -304,6 +328,5 @@ namespace MovieTracker.Backend.Functions
                 return new BadRequestObjectResult(ex.Message);
             }
         }
-
     }
 }

@@ -17,6 +17,7 @@ namespace MovieTracker.Backend
         public string id { get; set; }
         public string PartitionKey { get; set; }
         public ChatHistory ChatHistory { get; set; }
+        public string? FunnyFact { get; set; }
     }
 
     public class ChatSessionRepository(CosmosClient cosmosClient, ILogger<ChatSessionRepository> logger, Tracer tracer)
@@ -25,7 +26,6 @@ namespace MovieTracker.Backend
 
         private static string GenId()
         {
-
             var id = Convert.ToBase64String(RandomNumberGenerator.GetBytes(5)).Replace('/', '~').Replace('+', '-').Replace("=", "");
             if (id.Contains('-') || id.Contains('~'))
             {
@@ -36,6 +36,7 @@ namespace MovieTracker.Backend
                 return id;
             }
         }
+
         public async Task<MoviceTrackerChatSession> NewChatSession(ChatHistory chatHistory)
         {
             using var activity = tracer.StartActiveSpan("movie-tracker-func.chat-session-repository.new-chat-session");
@@ -47,7 +48,8 @@ namespace MovieTracker.Backend
                 {
                     id = id,
                     PartitionKey = partitionKey,
-                    ChatHistory = chatHistory
+                    ChatHistory = chatHistory,
+                    FunnyFact = null  // Initialize with null
                 };
                 var content = JsonSerializer.Serialize(movieChatSession);
                 var response = await chatHistoryContainer.CreateItemAsync<MoviceTrackerChatSession>(movieChatSession, new PartitionKey(partitionKey));
@@ -59,6 +61,7 @@ namespace MovieTracker.Backend
                 throw;
             }
         }
+
         public async Task<MoviceTrackerChatSession> GetChatSession(string id)
         {
             using var activity = tracer.StartActiveSpan("movie-tracker-func.chat-session-repository.get-chat-session");
@@ -73,6 +76,7 @@ namespace MovieTracker.Backend
                 throw;
             }
         }
+
         public async Task<MoviceTrackerChatSession> UpdateChatSession(string id, ChatHistory chatHistory)
         {
             using var activity = tracer.StartActiveSpan("movie-tracker-func.chat-session-repository.update-chat-session");
@@ -83,6 +87,42 @@ namespace MovieTracker.Backend
                 movieChatSession.ChatHistory = chatHistory;
                 var updateResponse = await chatHistoryContainer.ReplaceItemAsync(movieChatSession, id, new PartitionKey(id));
                 return movieChatSession;
+            }
+            catch (Exception ex)
+            {
+                logger.LogCritical("{@ex}", ex);
+                throw;
+            }
+        }
+
+        public async Task<MoviceTrackerChatSession> UpdateChatSession(string id, ChatHistory chatHistory, string? funnyFact)
+        {
+            using var activity = tracer.StartActiveSpan("movie-tracker-func.chat-session-repository.update-chat-session-with-funny-fact");
+            try
+            {
+                var response = await chatHistoryContainer.ReadItemAsync<MoviceTrackerChatSession>(id, new PartitionKey(id));
+                MoviceTrackerChatSession movieChatSession = response.Resource;
+                movieChatSession.ChatHistory = chatHistory;
+
+                movieChatSession.FunnyFact = funnyFact;
+
+                var updateResponse = await chatHistoryContainer.ReplaceItemAsync(movieChatSession, id, new PartitionKey(id));
+                return movieChatSession;
+            }
+            catch (Exception ex)
+            {
+                logger.LogCritical("{@ex}", ex);
+                throw;
+            }
+        }
+
+        public async Task<MoviceTrackerChatSession> SaveChatSession(MoviceTrackerChatSession movieChatSession)
+        {
+            using var activity = tracer.StartActiveSpan("movie-tracker-func.chat-session-repository.save-chat-session");
+            try
+            {
+                var updateResponse = await chatHistoryContainer.ReplaceItemAsync(movieChatSession, movieChatSession.id, new PartitionKey(movieChatSession.PartitionKey));
+                return updateResponse.Resource;
             }
             catch (Exception ex)
             {

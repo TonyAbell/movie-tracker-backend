@@ -17,6 +17,7 @@ using MovieTracker.Backend;
 using MovieTracker.Backend.Prompts;
 using Azure.Monitor.OpenTelemetry.Exporter;
 using OpenTelemetry.Logs;
+using MovieTracker.Backend.Agents;
 
 var serviceName = "movie-tracker-backend";
 var serviceVersion = "1.0.0";
@@ -79,6 +80,8 @@ var host = new HostBuilder()
             return new CosmosClient(connectionString, cosmosClientOptions);
         });
         services.AddScoped<ChatSessionRepository>();
+        services.AddHttpClient<WikipediaSearchAgent>();
+        services.AddScoped<WikipediaSearchAgent>();
         services.AddScoped<Kernel>(serviceProvider =>
         {
 

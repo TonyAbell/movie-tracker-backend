@@ -15,6 +15,7 @@ using Microsoft.AspNetCore.DataProtection.KeyManagement;
 using TMDbLib.Client;
 using Microsoft.Extensions.Configuration;
 using MovieTracker.Backend.Prompts;
+using MovieTracker.Backend.Agents;
 
 namespace MovieTracker.Backend.Functions
 {
@@ -122,9 +123,8 @@ namespace MovieTracker.Backend.Functions
         public string MovieName { get; set; }
     }
 
-    public class Function(Kernel kernel, ChatSessionRepository chatSessionRepository,IDistributedCache cache, IConfiguration configuration,ILogger<Function> logger, Tracer tracer)
+    public class Function(Kernel kernel, ChatSessionRepository chatSessionRepository,IDistributedCache cache, IConfiguration configuration,ILogger<Function> logger, Tracer tracer, WikipediaSearchAgent wikipediaAgent)
     {
-
         private readonly string apiKey = configuration["TheMovieDb:Api-Key"] ?? throw new ArgumentNullException("Missing The Movice Db Api Key");
 
 
@@ -134,34 +134,32 @@ namespace MovieTracker.Backend.Functions
             using var activity = tracer.StartActiveSpan("movie-tracker-func.chat-start");
             try
             {
-
                 var systemMessage = """
-                    You are a friendly assistant who follows instructions strictly. Your response must always be a JSON object and nothing else.
-                    The JSON object must contain the following properties:
+            You are an enthusiastic movie expert and friendly assistant who loves sharing fascinating insights about films, actors, and directors. 
 
-                    - "SystemMessage": A string providing a relevant message to the user. If no movies are found, indicate this and provide hints on how to ask/search for movies.
-                    - "MovieList": An array of objects, each having:
-                      - "MovieId": A string representing the movie's identifier.
-                      - "MovieName": A string representing the movie's name.
+            When users ask about movies, provide engaging, conversational responses that include:
+            - Interesting trivia and behind-the-scenes facts
+            - Cultural impact and significance
+            - Fun connections between actors, directors, and other films
+            - Engaging descriptions that make movies sound exciting
 
-                    If you cannot find any movies, return the following JSON object:
-                    {
-                      "SystemMessage": "No movies were found. Try refining your search with more specific keywords, such as a genre, release year, or actor name. For example: 'action movies from 2020', 'comedy movies with Will Smith', or 'animated movies from the 90s'.",
-                      "MovieList": []
-                    }
+            Your response must always be a JSON object with these properties:
+            - "SystemMessage": A rich, engaging message (2-4 sentences) that's informative yet entertaining. Use enthusiastic but not over-the-top language. Include interesting details, trivia, or context that makes the movie sound compelling.
+            - "MovieList": An array of movie objects with MovieId and MovieName properties.
 
-                    Otherwise, return an object like this:
-                    {
-                      "SystemMessage": "Here is the list of movies:",
-                      "MovieList": [
-                        {
-                          "MovieId": "1",
-                          "MovieName": "The Movie"
-                        }
-                      ]
-                    }
-                    Remember to respond only with a JSON object that follows this structure.
-                    """;
+            Examples of good SystemMessage responses:
+            - "Inception is Nolan's mind-bending masterpiece where dreams have dreams! The rotating hallway fight took 3 weeks to film and Leonardo DiCaprio's spinning top became one of cinema's most iconic props."
+            - "The Matrix revolutionized action cinema with its bullet-time effects and deep philosophical themes. Keanu Reeves trained for 4 months to perform his own stunts, and the green 'code' is actually Japanese sushi recipes!"
+
+            If no specific movies are found, provide helpful search suggestions in an engaging way:
+            {
+              "SystemMessage": "Hmm, I couldn't find specific movies matching that! Try being more specific - like 'sci-fi movies from 2010' or 'comedies with Ryan Reynolds'. I'm great at finding hidden gems and blockbusters alike!",
+              "MovieList": []
+            }
+
+            Always respond only with a JSON object. Keep responses informative but concise (2-4 sentences max).
+            """;
+
                 ChatHistory chatHistory = new(systemMessage);
                 var newChatSession = await chatSessionRepository.NewChatSession(chatHistory);
                 return new OkObjectResult(new ChatSessionIdResponse(newChatSession.id));
@@ -172,6 +170,7 @@ namespace MovieTracker.Backend.Functions
                 return new BadRequestObjectResult(ex.Message);
             }
         }
+
         private async Task ProcessMovieAsync(JsonElement movie, List<MovieViewModel> movieItems, TMDbClient client)
         {
             var movieId = movie.GetProperty("MovieId").GetString();
@@ -237,9 +236,13 @@ namespace MovieTracker.Backend.Functions
                     return new BadRequestObjectResult("Chat not found");
                 }
 
-                var chatPlanner = new ChatPlanner(kernel);
+                var chatPlanner = new ChatPlanner(kernel, wikipediaAgent);
 
-                string? funnyFact = await chatPlanner.GenerateFunnyFact(ask.Input);
+                // Add the enhanced context function to kernel
+                kernel.Plugins.Add(KernelPluginFactory.CreateFromObject(chatPlanner));
+
+                //string? funnyFact = await chatPlanner.GenerateFunnyFact(ask.Input);
+                string? funnyFact = await chatPlanner.GenerateEnhancedFunnyFact(ask.Input);
 
                 if (funnyFact != null)
                 {

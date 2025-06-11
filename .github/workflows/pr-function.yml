@@ -30,7 +30,8 @@ jobs:
           APP_INSIGHTS_NAME=$(az resource list \
             --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
             --resource-type Microsoft.Insights/components \
-            --query "[0].name" -o tsv)          STORAGE_ACCOUNT_NAME=$(az resource list \
+            --query "[0].name" -o tsv)
+          STORAGE_ACCOUNT_NAME=$(az resource list \
             --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
             --resource-type Microsoft.Storage/storageAccounts \
             --query "[0].name" -o tsv)

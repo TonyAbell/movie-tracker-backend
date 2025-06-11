@@ -37,29 +37,13 @@ jobs:
             --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
             --resource-type Microsoft.Insights/components \
             --query \"[0].name\" -o tsv)" >> $GITHUB_ENV
-
-      - name: Get Storage Account Name
-        id: get-storage-account
+   
+      - name: Get App Service Plan Name
+        id: get-app-plan
         run: |
-          echo "STORAGE_ACCOUNT_NAME=$(az resource list \
+          echo "APP_SERVICE_PLAN_NAME=$(az resource list \
             --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
-            --resource-type Microsoft.Storage/storageAccounts \
-            --query \"[0].name\" -o tsv)" >> $GITHUB_ENV
-
-      - name: Get Storage Account Key
-        id: get-storage-key
-        run: |
-          echo "STORAGE_ACCOUNT_KEY=$(az storage account keys list \
-            --account-name $STORAGE_ACCOUNT_NAME \
-            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
-            --query \"[0].value\" -o tsv)" >> $GITHUB_ENV
-
-      - name: Get Function Content Share Name
-        id: get-content-share
-        run: |
-          echo "FUNC_CONTENT_SHARE_NAME=$(az storage share list \
-            --account-name $STORAGE_ACCOUNT_NAME \
-            --account-key $STORAGE_ACCOUNT_KEY \
+            --resource-type Microsoft.Web/serverfarms \
             --query \"[0].name\" -o tsv)" >> $GITHUB_ENV
 
       - name: Deploy Function App (Bicep)
@@ -72,7 +56,7 @@ jobs:
               prNumber=${{ github.event.pull_request.number }} \
               keyVaultName=$KEY_VAULT_NAME \
               appInsightName=$APP_INSIGHTS_NAME \
-              funcContentShareName=$FUNC_CONTENT_SHARE_NAME
+              appServicePlanName=$APP_SERVICE_PLAN_NAME
 
       - name: Wait for deployment to settle
         env:

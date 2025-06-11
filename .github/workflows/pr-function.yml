@@ -1,0 +1,80 @@
+name: PR Azure Function Deployment
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+jobs:
+  deploy:
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Install Azure Functions Core Tools
+        run: npm install -g azure-functions-core-tools@4 --unsafe-perm true
+      - name: Deploy Function App
+        run: |
+          KEY_VAULT_NAME=$(az resource list \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --resource-type Microsoft.KeyVault/vaults \
+            --query "[0].name" -o tsv)
+          APP_INSIGHTS_NAME=$(az resource list \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --resource-type Microsoft.Insights/components \
+            --query "[0].name" -o tsv)
+          STORAGE_ACCOUNT_NAME=$(az resource list \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --resource-type Microsoft.Storage/storageAccounts \
+            --query "[0].name" -o tsv)
+          FUNC_CONTENT_SHARE_NAME=$(az storage share list \
+            --account-name "$STORAGE_ACCOUNT_NAME" --auth-mode login \
+            --query "[0].name" -o tsv)
+          az deployment group create \
+            --name pr-${{ github.event.pull_request.number }} \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --template-file infrastructure/func-pr.bicep \
+            --parameters prNumber=${{ github.event.pull_request.number }} \
+                       keyVaultName=$KEY_VAULT_NAME \
+                       appInsightName=$APP_INSIGHTS_NAME \
+                       funcContentShareName=$FUNC_CONTENT_SHARE_NAME
+      - name: Wait for deployment to settle
+        env:
+          WAIT_SECONDS: ${{ vars.DEPLOY_PAUSE_SECONDS }}
+        run: |
+          seconds=${WAIT_SECONDS:-30}
+          echo "Sleeping for $seconds seconds to allow resources to stabilize"
+          sleep "$seconds"
+      - name: Publish Function Code
+        run: |
+          pushd src/MovieTracker.Backend
+          func azure functionapp publish $(az deployment group show \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --name pr-${{ github.event.pull_request.number }} \
+            --query properties.outputs.functionAppName.value -o tsv) --nozip
+          popd
+  cleanup:
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Delete Function App
+        run: |
+          app_name="$(az deployment group show \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --name pr-${{ github.event.pull_request.number }} \
+            --query properties.outputs.functionAppName.value -o tsv || true)"
+          if [ -n "$app_name" ]; then
+            az functionapp delete --name "$app_name" --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }}
+          fi
+          plan_name="$(az deployment group show \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --name pr-${{ github.event.pull_request.number }} \
+            --query properties.outputs.functionAppId.value -o tsv | xargs basename || true)"
+          if [ -n "$plan_name" ]; then
+            az resource delete --ids $(az resource list --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} --query "[?name=='$plan_name'] .id" -o tsv) || true
+          fi

@@ -14,7 +14,7 @@ jobs:
     environment: prod
     steps:
       - uses: actions/checkout@v3
-      
+
       - name: Setup .NET 9 SDK
         uses: actions/setup-dotnet@v3
         with:
@@ -96,7 +96,7 @@ jobs:
               --resource-group movie-tracker-rg \
               --name pr-${{ github.event.pull_request.number }} \
               --query properties.outputs.functionAppName.value -o tsv) \
-            --dotnet-isolated
+            --dotnet-isolated \
             --nozip
           popd
 

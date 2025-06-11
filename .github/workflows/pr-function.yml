@@ -15,6 +15,12 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
+      - name: Downgrade Azure CLI to 2.72.0
+        run: |
+          echo "Downgrading Azure CLI to version 2.72.0 to work around response consumption bug"
+          pip install azure-cli==2.72.0
+          az version
+
       - uses: azure/login@v1
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -82,7 +88,7 @@ jobs:
           pushd src/MovieTracker.Backend
           func azure functionapp publish \
             $(az deployment group show \
-              --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+              --resource-group movie-tracker-rg \
               --name pr-${{ github.event.pull_request.number }} \
               --query properties.outputs.functionAppName.value -o tsv) \
             --nozip

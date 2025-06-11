@@ -1,13 +1,13 @@
 param prNumber string
 param keyVaultName string
 param appInsightName string
-param funcContentShareName string
+param appServicePlanName string
 param createFuncRoleAssignment bool = true
 param location string = resourceGroup().location
 
 var uniqueSuffix = uniqueString(resourceGroup().id, prNumber)
-var appServicePlanName = toLower('${uniqueSuffix}-func-service-plan-pr${prNumber}')
-var functionAppName = toLower('${uniqueSuffix}-func-movie-tracker-pr${prNumber}')
+
+var functionAppName = toLower('${uniqueSuffix}-func-movie-tracker-pr-${prNumber}')
 
 resource keyVault 'Microsoft.KeyVault/vaults@2023-02-01' existing = {
   name: keyVaultName
@@ -22,13 +22,9 @@ resource appInsights 'Microsoft.Insights/components@2020-02-02' existing = {
   name: appInsightName
 }
 
-resource appServicePlan 'Microsoft.Web/serverfarms@2023-12-01' = {
+resource appServicePlan 'Microsoft.Web/serverfarms@2023-12-01' existing = {
   name: appServicePlanName
-  location: location
-  sku: {
-    name: 'Y1'
-    tier: 'Dynamic'
-  }
+  
 }
 
 resource functionApp 'Microsoft.Web/sites@2021-01-01' = {
@@ -42,7 +38,7 @@ resource functionApp 'Microsoft.Web/sites@2021-01-01' = {
     serverFarmId: appServicePlan.id
     siteConfig: {
       use32BitWorkerProcess: false
-      netFrameworkVersion: 'v8.0'
+      netFrameworkVersion: 'v9.0'
       appSettings: [
         {
           name: 'FUNCTIONS_EXTENSION_VERSION'
@@ -56,14 +52,14 @@ resource functionApp 'Microsoft.Web/sites@2021-01-01' = {
           name: 'AzureWebJobsStorage'
           value: '@Microsoft.KeyVault(SecretUri=${vaultSecret_AzureWebJobsStorage.properties.secretUriWithVersion})'
         }
-        {
-          name: 'WEBSITE_CONTENTAZUREFILECONNECTIONSTRING'
-          value: '@Microsoft.KeyVault(SecretUri=${vaultSecret_AzureWebJobsStorage.properties.secretUriWithVersion})'
-        }
-        {
-          name: 'WEBSITE_CONTENTSHARE'
-          value: funcContentShareName
-        }
+        // {
+        //   name: 'WEBSITE_CONTENTAZUREFILECONNECTIONSTRING'
+        //   value: '@Microsoft.KeyVault(SecretUri=${vaultSecret_AzureWebJobsStorage.properties.secretUriWithVersion})'
+        // }
+        // {
+        //   name: 'WEBSITE_CONTENTSHARE'
+        //   value: funcContentShareName
+        // }
         {
           name: 'WEBSITE_USE_PLACEHOLDER_DOTNETISOLATED'
           value: '1'

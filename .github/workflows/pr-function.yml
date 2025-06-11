@@ -14,34 +14,56 @@ jobs:
     environment: prod
     steps:
       - uses: actions/checkout@v3
+
       - uses: azure/login@v1
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Deploy Function App (Bicep)
+      - name: Get Key Vault Name
+        id: get-key-vault
         run: |
-          KEY_VAULT_NAME=$(az resource list \
+          echo "Retrieving Key Vault name..."
+          echo "KEY_VAULT_NAME=$(az resource list \
             --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
             --resource-type Microsoft.KeyVault/vaults \
-            --query "[0].name" -o tsv)
-          APP_INSIGHTS_NAME=$(az resource list \
+            --query \"[0].name\" -o tsv)" >> $GITHUB_ENV
+
+      - name: Get Application Insights Name
+        id: get-app-insights
+        run: |
+          echo "APP_INSIGHTS_NAME=$(az resource list \
             --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
             --resource-type Microsoft.Insights/components \
-            --query "[0].name" -o tsv)
-          STORAGE_ACCOUNT_NAME=$(az resource list \
+            --query \"[0].name\" -o tsv)" >> $GITHUB_ENV
+
+      - name: Get Storage Account Name
+        id: get-storage-account
+        run: |
+          echo "STORAGE_ACCOUNT_NAME=$(az resource list \
             --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
             --resource-type Microsoft.Storage/storageAccounts \
-            --query "[0].name" -o tsv)
-          STORAGE_ACCOUNT_KEY=$(az storage account keys list \
-            --account-name "$STORAGE_ACCOUNT_NAME" \
+            --query \"[0].name\" -o tsv)" >> $GITHUB_ENV
+
+      - name: Get Storage Account Key
+        id: get-storage-key
+        run: |
+          echo "STORAGE_ACCOUNT_KEY=$(az storage account keys list \
+            --account-name $STORAGE_ACCOUNT_NAME \
             --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
-            --query "[0].value" -o tsv)
-          FUNC_CONTENT_SHARE_NAME=$(az storage share list \
-            --account-name "$STORAGE_ACCOUNT_NAME" \
-            --account-key "$STORAGE_ACCOUNT_KEY" \
-            --query "[0].name" -o tsv)
+            --query \"[0].value\" -o tsv)" >> $GITHUB_ENV
+
+      - name: Get Function Content Share Name
+        id: get-content-share
+        run: |
+          echo "FUNC_CONTENT_SHARE_NAME=$(az storage share list \
+            --account-name $STORAGE_ACCOUNT_NAME \
+            --account-key $STORAGE_ACCOUNT_KEY \
+            --query \"[0].name\" -o tsv)" >> $GITHUB_ENV
+
+      - name: Deploy Function App (Bicep)
+        run: |
           az deployment group create \
             --name pr-${{ github.event.pull_request.number }} \
             --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
@@ -55,8 +77,7 @@ jobs:
       - name: Wait for deployment to settle
         env:
           WAIT_SECONDS: ${{ vars.DEPLOY_PAUSE_SECONDS }}
-        run: |
-          sleep ${WAIT_SECONDS:-30}
+        run: sleep ${WAIT_SECONDS:-30}
 
       - name: Install Azure Functions Core Tools
         run: npm install -g azure-functions-core-tools@4 --unsafe-perm true

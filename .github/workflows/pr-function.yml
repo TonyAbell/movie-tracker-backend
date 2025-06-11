@@ -24,7 +24,7 @@ jobs:
       - name: Get Key Vault Name
         id: get-key-vault
         run: |
-          echo "Retrieving Key Vault name..."
+          echo "Retrieving Key Vault name…"
           echo "KEY_VAULT_NAME=$(az resource list \
             --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
             --resource-type Microsoft.KeyVault/vaults \
@@ -33,18 +33,26 @@ jobs:
       - name: Get Application Insights Name
         id: get-app-insights
         run: |
+          echo "Retrieving App Insights name…"
           echo "APP_INSIGHTS_NAME=$(az resource list \
             --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
             --resource-type Microsoft.Insights/components \
             --query \"[0].name\" -o tsv)" >> $GITHUB_ENV
-   
+
       - name: Get App Service Plan Name
         id: get-app-plan
         run: |
+          echo "Retrieving App Service Plan name…"
           echo "APP_SERVICE_PLAN_NAME=$(az resource list \
             --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
             --resource-type Microsoft.Web/serverfarms \
             --query \"[0].name\" -o tsv)" >> $GITHUB_ENV
+
+      - name: Debug env vars
+        run: |
+          echo "KV: $KEY_VAULT_NAME"
+          echo "AI: $APP_INSIGHTS_NAME"
+          echo "PLAN: $APP_SERVICE_PLAN_NAME"
 
       - name: Deploy Function App (Bicep)
         run: |
@@ -53,10 +61,11 @@ jobs:
             --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
             --template-file infrastructure/func-pr.bicep \
             --parameters \
-              prNumber=${{ github.event.pull_request.number }} \
-              keyVaultName=$KEY_VAULT_NAME \
-              appInsightName=$APP_INSIGHTS_NAME \
-              appServicePlanName=$APP_SERVICE_PLAN_NAME
+                prNumber=${{ github.event.pull_request.number }} \
+                keyVaultName=$KEY_VAULT_NAME \
+                appInsightName=$APP_INSIGHTS_NAME \
+                appServicePlanName=$APP_SERVICE_PLAN_NAME
+
 
       - name: Wait for deployment to settle
         env:

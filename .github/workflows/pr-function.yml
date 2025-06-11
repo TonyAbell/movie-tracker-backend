@@ -1,0 +1,135 @@
+name: PR Azure Function Deployment
+permissions:
+  id-token: write
+  contents: read
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+jobs:
+  deploy:
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup .NET 9 SDK
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Downgrade Azure CLI to 2.72.0
+        run: |
+          echo "Downgrading Azure CLI to version 2.72.0 to work around response consumption bug"
+          pip install azure-cli==2.72.0
+          az version
+
+      - uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get Key Vault Name
+        id: get-key-vault
+        run: |
+          KEY_VAULT_NAME=$(az resource list \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --resource-type Microsoft.KeyVault/vaults \
+            --query "[0].name" -o tsv)
+          echo "KEY_VAULT_NAME=${KEY_VAULT_NAME}" >> $GITHUB_ENV
+          echo "Key vault name: ${KEY_VAULT_NAME}"
+
+      - name: Get Application Insights Name
+        id: get-app-insights
+        run: |
+          APP_INSIGHTS_NAME=$(az resource list \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --resource-type Microsoft.Insights/components \
+            --query "[0].name" -o tsv)
+          echo "APP_INSIGHTS_NAME=${APP_INSIGHTS_NAME}" >> $GITHUB_ENV
+          echo "App insights name: ${APP_INSIGHTS_NAME}"
+
+      - name: Get App Service Plan Name
+        id: get-app-plan
+        run: |
+          APP_SERVICE_PLAN_NAME=$(az resource list \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --resource-type Microsoft.Web/serverfarms \
+            --query "[0].name" -o tsv)
+          echo "APP_SERVICE_PLAN_NAME=${APP_SERVICE_PLAN_NAME}" >> $GITHUB_ENV
+          echo "App service plan name: ${APP_SERVICE_PLAN_NAME}"
+
+      - name: Debug env vars
+        run: |
+          echo "KV: $KEY_VAULT_NAME"
+          echo "AI: $APP_INSIGHTS_NAME"
+          echo "PLAN: $APP_SERVICE_PLAN_NAME"
+
+      - name: Deploy Function App (Bicep)
+        run: |
+          az deployment group create \
+            --name pr-${{ github.event.pull_request.number }} \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --template-file infrastructure/func-pr.bicep \
+            --parameters \
+              prNumber=${{ github.event.pull_request.number }} \
+              keyVaultName="${KEY_VAULT_NAME}" \
+              appInsightName="${APP_INSIGHTS_NAME}" \
+              appServicePlanName="${APP_SERVICE_PLAN_NAME}"
+
+      - name: Wait for deployment to settle
+        env:
+          WAIT_SECONDS: ${{ vars.DEPLOY_PAUSE_SECONDS }}
+        run: sleep ${WAIT_SECONDS:-30}
+
+      - name: Install Azure Functions Core Tools
+        run: npm install -g azure-functions-core-tools@4 --unsafe-perm true
+
+      - name: Publish Function Code
+        run: |
+          pushd src/MovieTracker.Backend
+          func azure functionapp publish \
+            $(az deployment group show \
+              --resource-group movie-tracker-rg \
+              --name pr-${{ github.event.pull_request.number }} \
+              --query properties.outputs.functionAppName.value -o tsv) \
+            --dotnet-isolated \
+            --nozip
+          popd
+
+  cleanup:
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Delete Function App
+        run: |
+          app_name=$(az deployment group show \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --name pr-${{ github.event.pull_request.number }} \
+            --query properties.outputs.functionAppName.value -o tsv || true)
+          if [ -n "$app_name" ]; then
+            az functionapp delete \
+              --name "$app_name" \
+              --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }}
+          fi
+          plan_name=$(az deployment group show \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --name pr-${{ github.event.pull_request.number }} \
+            --query properties.outputs.functionAppId.value -o tsv \
+            | xargs basename || true)
+          if [ -n "$plan_name" ]; then
+            az resource delete \
+              --ids $(az resource list \
+                --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+                --query "[?name=='$plan_name'].id" -o tsv) \
+              || true
+          fi

@@ -55,6 +55,21 @@ The infrastructure for the Movie Tracker Backend is managed using Bicep scripts,
 
 By following these instructions, you will set up the necessary infrastructure for the Movie Tracker Backend, including obtaining and configuring the required API keys for OpenAI and The Movie Database, and setting up Azure Entra RBAC access.
 
+## CI/CD Pull Request Deployments
+
+This repository includes a GitHub Actions workflow that automatically deploys a separate Azure Function for every pull request. When a PR is opened or updated, a new function app is provisioned using `infrastructure/func-pr.bicep` and the branch is published to that instance. When the PR is closed, the temporary function app is removed.
+
+To enable the workflow, configure the following secrets in your repository:
+
+- `AZURE_CREDENTIALS` – service principal credentials used by `azure/login`.
+- `AZURE_RESOURCE_GROUP` – the resource group where PR functions will be deployed.
+
+The workflow uses the Azure CLI to discover the existing Key Vault, Application Insights, and storage resources within the specified resource group, so no additional secrets are required.
+
+You can optionally set a repository variable named `DEPLOY_PAUSE_SECONDS` to control how long the workflow waits between deploying infrastructure and publishing the function code. The default delay is 30 seconds.
+
+Once configured, pushes to a PR will automatically deploy and update an isolated function app. Closing the PR triggers the cleanup job to remove the temporary resources.
+
 
 
 ## How to Use

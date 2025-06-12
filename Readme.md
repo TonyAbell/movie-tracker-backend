@@ -70,6 +70,10 @@ You can optionally set a repository variable named `DEPLOY_PAUSE_SECONDS` to con
 
 Once configured, pushes to a PR will automatically deploy and update an isolated function app. Closing the PR triggers the cleanup job to remove the temporary resources.
 
+### Production Deployment
+The `deploy-main.yml` workflow runs when a pull request targeting the `main` branch is merged. It publishes the updated code to the existing production function app without recreating infrastructure.
+
+
 
 
 ## How to Use

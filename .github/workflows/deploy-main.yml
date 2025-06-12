@@ -1,0 +1,54 @@
+name: Deploy Main Function
+permissions:
+  id-token: write
+  contents: read
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  deploy:
+    if: github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup .NET 9 SDK
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Downgrade Azure CLI to 2.72.0
+        run: |
+          echo "Downgrading Azure CLI to version 2.72.0 to work around response consumption bug"
+          pip install azure-cli==2.72.0
+          az version
+
+      - uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get Function App Name
+        id: get-func
+        run: |
+          FUNCTION_APP_NAME=$(az functionapp list \
+              --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+              --query "[?contains(name, '-pr-')==\`false\`].name | [0]" -o tsv)
+          echo "FUNCTION_APP_NAME=${FUNCTION_APP_NAME}" >> $GITHUB_ENV
+          echo "Function app name: ${FUNCTION_APP_NAME}"
+
+      - name: Install Azure Functions Core Tools
+        run: npm install -g azure-functions-core-tools@4 --unsafe-perm true
+
+      - name: Publish Function Code
+        run: |
+          pushd src/MovieTracker.Backend
+          func azure functionapp publish ${FUNCTION_APP_NAME} \
+            --dotnet-isolated \
+            --nozip
+          popd
+

@@ -120,6 +120,7 @@ var host = new HostBuilder()
             var httpClient = httpClientFactory.CreateClient("HttpClient");
             kernelBuilder.AddOpenAIChatCompletion(openAIOptions.TextModel, openAIOptions.APIKey, httpClient: httpClient);
             kernelBuilder.Plugins.AddFromType<TheMovieDBKernelFunctions>();
+            kernelBuilder.Plugins.AddFromType<DateTimeKernelFunctions>();
 
             //kernelBuilder.Plugins.AddFromType<ChatPlanner>();
             var kernel = kernelBuilder.Build();

@@ -10,11 +10,94 @@ namespace MovieTracker.Backend.Prompts
     {
         private readonly Kernel kernel;
         private readonly WikipediaSearchAgent wikipediaAgent;
+        private readonly OpenMovieDbAgent openMovieDbAgent;
 
-        public ChatPlanner(Kernel kernel, WikipediaSearchAgent wikipediaAgent)
+        public ChatPlanner(Kernel kernel, WikipediaSearchAgent wikipediaAgent, OpenMovieDbAgent openMovieDbAgent)
         {
             this.kernel = kernel;
             this.wikipediaAgent = wikipediaAgent;
+            this.openMovieDbAgent = openMovieDbAgent;
+        }
+
+        [KernelFunction]
+        [Description("Get IMDb rating and comprehensive ratings for a specific movie using its IMDb ID")]
+        [return: Description("JSON object containing IMDb rating, Rotten Tomatoes, Metacritic, and box office data")]
+        public async Task<string> GetMovieRating(
+            [Description("The IMDb ID of the movie (e.g., 'tt1375666')")] string imdbId)
+        {
+            var result = await openMovieDbAgent.GetMovieRatings(imdbId);
+
+            if (!result.IsSuccess)
+            {
+                return JsonSerializer.Serialize(new { Error = result.ErrorMessage });
+            }
+
+            return JsonSerializer.Serialize(new
+            {
+                Title = result.Title,
+                Year = result.Year,
+                ImdbRating = result.ImdbRating,
+                RottenTomatoesRating = result.RottenTomatoesRating,
+                MetacriticRating = result.MetacriticRating,
+                BoxOffice = result.BoxOffice,
+                Summary = $"{result.Title} ({result.Year}) has an IMDb rating of {result.ImdbRating}"
+            });
+        }
+
+        [KernelFunction]
+        [Description("Compare IMDb ratings of multiple movies and find the highest rated one")]
+        [return: Description("Comparison results showing which movie has the highest IMDb rating")]
+        public async Task<string> CompareMovieRatings(
+            [Description("Comma-separated list of IMDb IDs to compare (e.g., 'tt0068646,tt0071562,tt0099685')")] string imdbIds)
+        {
+            var ids = imdbIds.Split(',').Select(id => id.Trim()).ToList();
+            var result = await openMovieDbAgent.CompareMovieRatings(ids);
+
+            if (!result.IsSuccess)
+            {
+                return JsonSerializer.Serialize(new { Error = result.ErrorMessage });
+            }
+
+            return JsonSerializer.Serialize(new
+            {
+                Winner = result.HighestRatedTitle,
+                HighestRating = result.HighestRating,
+                AllMovies = result.AllMovies.Select(m => new
+                {
+                    Title = $"{m.Title} ({m.Year})",
+                    ImdbRating = m.ImdbRating,
+                    RottenTomatoesRating = m.RottenTomatoesRating,
+                    MetacriticRating = m.MetacriticRating
+                }),
+                Summary = $"{result.HighestRatedTitle} has the highest IMDb rating of {result.HighestRating}"
+            });
+        }
+
+        [KernelFunction]
+        [Description("Filter a list of movies to only include those with IMDb ratings above a threshold")]
+        [return: Description("List of movies that meet the minimum IMDb rating requirement")]
+        public async Task<string> FilterMoviesByRating(
+            [Description("Comma-separated list of IMDb IDs to filter")] string imdbIds,
+            [Description("Minimum IMDb rating threshold (e.g., 7.0)")] double minimumRating)
+        {
+            var ids = imdbIds.Split(',').Select(id => id.Trim()).ToList();
+            var qualifyingMovies = await openMovieDbAgent.FilterMoviesByRating(ids, minimumRating);
+
+            return JsonSerializer.Serialize(new
+            {
+                MinimumRating = minimumRating,
+                TotalMoviesChecked = ids.Count,
+                QualifyingMoviesCount = qualifyingMovies.Count,
+                QualifyingMovies = qualifyingMovies.Select(m => new
+                {
+                    Title = $"{m.Title} ({m.Year})",
+                    ImdbRating = m.ImdbRating,
+                    RottenTomatoesRating = m.RottenTomatoesRating,
+                    MetacriticRating = m.MetacriticRating,
+                    BoxOffice = m.BoxOffice
+                }),
+                Summary = $"Found {qualifyingMovies.Count} out of {ids.Count} movies with IMDb rating {minimumRating}+"
+            });
         }
 
         [KernelFunction]
@@ -128,7 +211,8 @@ namespace MovieTracker.Backend.Prompts
                   "MovieList": [
                     {
                       "MovieId": "1",
-                      "MovieName": "The Movie"
+                      "MovieName": "The Movie",
+                      "ImdbId": "tt1234567"
                     }
                   ]
                 }

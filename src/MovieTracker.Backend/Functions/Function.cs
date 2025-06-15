@@ -24,27 +24,43 @@ namespace MovieTracker.Backend.Functions
     {
         public string Input { get; set; } = string.Empty;
     }
-//    export interface TmdbMovieModel
-//    {
-//        poster_path: string;
-//    adult: boolean;
-//    overview: string;
-//    release_date: string;
-//    genre_ids: number[];
-//    id: string;
-//    original_title: string;
-//    original_language: string;
-//    title: string;
-//    backdrop_path: string;
-//    popularity: number;
-//    vote_count: number;
-//    video: boolean;
-//    vote_average: number;
-//    favorite: boolean;
-//}
+    //    export interface TmdbMovieModel
+    //    {
+    //        poster_path: string;
+    //    adult: boolean;
+    //    overview: string;
+    //    release_date: string;
+    //    genre_ids: number[];
+    //    id: string;
+    //    original_title: string;
+    //    original_language: string;
+    //    title: string;
+    //    backdrop_path: string;
+    //    popularity: number;
+    //    vote_count: number;
+    //    video: boolean;
+    //    vote_average: number;
+    //    favorite: boolean;
+    //}
 
-    public record MovieViewModel(string PosterPath, bool Adult, string Overview, DateTime? ReleaseDate, List<int> GenreIds, string Id, string OriginalTitle, string OriginalLanguage, string Title, string BackdropPath, double? Popularity, int VoteCount, bool Video, double VoteAverage, bool Favorite);
-
+    public record MovieViewModel(
+        string PosterPath,
+        bool Adult,
+        string Overview,
+        DateTime? ReleaseDate,
+        List<int> GenreIds,
+        string Id,
+        string OriginalTitle,
+        string OriginalLanguage,
+        string Title,
+        string BackdropPath,
+        double? Popularity,
+        int VoteCount,
+        bool Video,
+        double VoteAverage,
+        bool Favorite,
+        string ImdbId
+    );
     public record MovieItem(string MovieId, string MovieName);
     public record LLMResponse(string SystemMessage, List<MovieItem> MovieList);
     
@@ -123,7 +139,7 @@ namespace MovieTracker.Backend.Functions
         public string MovieName { get; set; }
     }
 
-    public class Function(Kernel kernel, ChatSessionRepository chatSessionRepository,IDistributedCache cache, IConfiguration configuration,ILogger<Function> logger, Tracer tracer, WikipediaSearchAgent wikipediaAgent)
+    public class Function(Kernel kernel, ChatSessionRepository chatSessionRepository,IDistributedCache cache, IConfiguration configuration,ILogger<Function> logger, Tracer tracer, WikipediaSearchAgent wikipediaAgent, OpenMovieDbAgent openMovieDbAgent)
     {
         private readonly string apiKey = configuration["TheMovieDb:Api-Key"] ?? throw new ArgumentNullException("Missing The Movice Db Api Key");
 
@@ -195,12 +211,26 @@ namespace MovieTracker.Backend.Functions
             else
             {
                 var tmdbMovie = await client.GetMovieAsync(int.Parse(movieId));
+                var imdbId = tmdbMovie.ImdbId ?? "";
+
                 var movieViewModel = new MovieViewModel(
-                    tmdbMovie.PosterPath, tmdbMovie.Adult, tmdbMovie.Overview, tmdbMovie.ReleaseDate,
-                    tmdbMovie.Genres.Select(g => g.Id).ToList(), movieId,
-                    tmdbMovie.OriginalTitle, tmdbMovie.OriginalLanguage, tmdbMovie.Title,
-                    tmdbMovie.BackdropPath, tmdbMovie.Popularity, tmdbMovie.VoteCount,
-                    tmdbMovie.Video, tmdbMovie.VoteAverage, Favorite: false);
+                    tmdbMovie.PosterPath,
+                    tmdbMovie.Adult,
+                    tmdbMovie.Overview,
+                    tmdbMovie.ReleaseDate,
+                    tmdbMovie.Genres.Select(g => g.Id).ToList(),
+                    movieId,
+                    tmdbMovie.OriginalTitle,
+                    tmdbMovie.OriginalLanguage,
+                    tmdbMovie.Title,
+                    tmdbMovie.BackdropPath,
+                    tmdbMovie.Popularity,
+                    tmdbMovie.VoteCount,
+                    tmdbMovie.Video,
+                    tmdbMovie.VoteAverage,
+                    Favorite: false,
+                    imdbId
+                );
 
                 lock (movieItems) // Thread-safe access to shared list
                 {
@@ -236,7 +266,7 @@ namespace MovieTracker.Backend.Functions
                     return new BadRequestObjectResult("Chat not found");
                 }
 
-                var chatPlanner = new ChatPlanner(kernel, wikipediaAgent);
+                var chatPlanner = new ChatPlanner(kernel, wikipediaAgent, openMovieDbAgent);
 
                 // Add the enhanced context function to kernel
                 kernel.Plugins.Add(KernelPluginFactory.CreateFromObject(chatPlanner));

@@ -82,6 +82,7 @@ var host = new HostBuilder()
         services.AddScoped<ChatSessionRepository>();
         services.AddHttpClient<WikipediaSearchAgent>();
         services.AddScoped<WikipediaSearchAgent>();
+        services.AddScoped<OpenMovieDbAgent>();
         services.AddScoped<Kernel>(serviceProvider =>
         {
 

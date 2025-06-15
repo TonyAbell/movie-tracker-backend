@@ -89,11 +89,16 @@ resource functionApp 'Microsoft.Web/sites@2021-01-01' = {
   }
 }
 
+// Define role definition ID and deterministic role assignment name
+var roleDefinitionGuid = '4633458b-17de-408a-b874-0445c86b69e6'
+var roleDefinitionId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleDefinitionGuid)
+var roleAssignmentName = guid(keyVault.id, functionApp.id, roleDefinitionGuid)
+
 resource roleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (createFuncRoleAssignment) {
-  name: guid(functionApp.id, keyVault.id)
+  name: roleAssignmentName
   scope: keyVault
   properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')
+    roleDefinitionId: roleDefinitionId
     principalId: functionApp.identity.principalId
   }
 }

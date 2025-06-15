@@ -133,3 +133,11 @@ jobs:
                 --query "[?name=='$plan_name'].id" -o tsv) \
               || true
           fi
+      - name: Remove orphaned role assignments
+        run: |
+          resource_id=$(az functionapp show --name "$app_name" --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} --query id -o tsv || true)
+          if [ -n "$resource_id" ]; then
+            for assignment in $(az role assignment list --scope "$resource_id" --query "[].id" -o tsv); do
+              az role assignment delete --ids "$assignment"
+            done
+          fi

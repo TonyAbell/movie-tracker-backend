@@ -1,34 +1,72 @@
-﻿using Microsoft.SemanticKernel;
+using Microsoft.SemanticKernel;
+using System;
 using System.ComponentModel;
+using System.Globalization;
 
-namespace MovieTracker.Backend.Prompts;
-
-public class DateTimeKernelFunctions
+namespace MovieTracker.Backend.Prompts
 {
-    [KernelFunction]
-    [Description("Gets a year relative to the current year. 0 = current year, 1 = last year, 2 = two years ago, -1 = next year")]
-    [return: Description("The calculated year")]
-    public string Year(int yearsFromCurrent)
+    public class DateTimeKernelFunctions
     {
-        var targetYear = DateTime.Now.Year - yearsFromCurrent;
-        return targetYear.ToString();
-    }
+        // ---------- POINTS ----------
+        [KernelFunction, Description("Today in ISO format (YYYY-MM-DD)")]
+        public static string Today() => DateTime.UtcNow.ToString("yyyy-MM-dd");
 
-    [KernelFunction]
-    [Description("Gets a month relative to the current month. 0 = current month, 1 = last month, 2 = two months ago, -1 = next month")]
-    [return: Description("The calculated month and year in YYYY-MM format")]
-    public string Month(int monthsFromCurrent)
-    {
-        var targetDate = DateTime.Now.AddMonths(-monthsFromCurrent);
-        return targetDate.ToString("yyyy-MM");
-    }
+        [KernelFunction, Description("This month (first day) in ISO format (YYYY-MM)")]
+        public static string ThisMonth() => DateTime.UtcNow.ToString("yyyy-MM");
 
-    [KernelFunction]
-    [Description("Gets a day relative to today. 0 = today, 1 = yesterday, 2 = two days ago, -1 = tomorrow")]
-    [return: Description("The calculated date in YYYY-MM-DD format")]
-    public string Day(int daysFromCurrent)
-    {
-        var targetDate = DateTime.Now.AddDays(-daysFromCurrent);
-        return targetDate.ToString("yyyy-MM-dd");
+        [KernelFunction, Description("This year in ISO format (YYYY)")]
+        public static string ThisYear() => DateTime.UtcNow.Year.ToString();
+
+        // ---------- RANGES ----------
+        [KernelFunction]
+        [Description("ISO-8601 interval for the past <years> full years up to today. " +
+                     "Example: PastYearsRange(3) → 2022-06-13/2025-06-13")]
+        public static string PastYearsRange(
+            [Description("Number of years to look back (e.g. 3 = last three years)")]
+            int years)
+        {
+            var end = DateTime.UtcNow.Date;                 // inclusive
+            var start = end.AddYears(-years);
+            return $"{start:yyyy-MM-dd}/{end:yyyy-MM-dd}";
+        }
+
+        [KernelFunction]
+        [Description("ISO-8601 interval for the past <months> full months up to today. " +
+                     "Example: PastMonthsRange(6) → 2024-12-13/2025-06-13")]
+        public static string PastMonthsRange(int months)
+        {
+            var end = DateTime.UtcNow.Date;
+            var start = end.AddMonths(-months);
+            return $"{start:yyyy-MM-dd}/{end:yyyy-MM-dd}";
+        }
+
+        [KernelFunction]
+        [Description("ISO-8601 interval for the past <days> days up to today.")]
+        public static string PastDaysRange(int days)
+        {
+            var end = DateTime.UtcNow.Date;
+            var start = end.AddDays(-days);
+            return $"{start:yyyy-MM-dd}/{end:yyyy-MM-dd}";
+        }
+
+        // ---------- GENERIC ----------
+        [KernelFunction]
+        [Description("Offset any ISO date (YYYY-MM-DD) by N units. Units = d, m, y. " +
+                     "Example: OffsetDate(\"2022-05-20\", 10, \"d\")")]
+        public static string OffsetDate(
+            string isoDate,
+            int amount,
+            [Description("Unit (d=days, m=months, y=years)")] string unit)
+        {
+            var dt = DateTime.Parse(isoDate, CultureInfo.InvariantCulture);
+            var shifted = unit switch
+            {
+                "d" => dt.AddDays(amount),
+                "m" => dt.AddMonths(amount),
+                "y" => dt.AddYears(amount),
+                _   => throw new ArgumentException("unit must be d, m, or y")
+            };
+            return shifted.ToString("yyyy-MM-dd");
+        }
     }
 }

@@ -1,6 +1,7 @@
 ﻿using Microsoft.Extensions.Configuration;
 using OMDbApiNet;
 using OMDbApiNet.Model;
+using System.Globalization;
 
 namespace MovieTracker.Backend.Agents
 {
@@ -84,8 +85,8 @@ namespace MovieTracker.Backend.Agents
                 }
 
                 var highest = movieRatings
-                    .Where(m => double.TryParse(m.ImdbRating, out _))
-                    .OrderByDescending(m => double.Parse(m.ImdbRating))
+                    .Where(m => double.TryParse(m.ImdbRating, NumberStyles.Any, CultureInfo.InvariantCulture, out _))
+                    .OrderByDescending(m => double.Parse(m.ImdbRating, CultureInfo.InvariantCulture))
                     .FirstOrDefault();
 
                 if (highest == null)
@@ -114,7 +115,7 @@ namespace MovieTracker.Backend.Agents
             {
                 var rating = await GetMovieRatings(id);
                 if (rating.IsSuccess &&
-                    double.TryParse(rating.ImdbRating, out double actualRating) &&
+                    double.TryParse(rating.ImdbRating, NumberStyles.Any, CultureInfo.InvariantCulture, out double actualRating) &&
                     actualRating >= minimumRating)
                 {
                     qualifyingMovies.Add(rating);

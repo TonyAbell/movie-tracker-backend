@@ -20,8 +20,9 @@ namespace MovieTracker.Backend.Prompts
         }
 
         [KernelFunction]
-        [Description("Get IMDb rating and comprehensive ratings for a specific movie using its IMDb ID")]
-        [return: Description("JSON object containing IMDb rating, Rotten Tomatoes, Metacritic, and box office data")]
+        [Description("Get movie rating (defaults to IMDb rating) for a specific movie using its IMDb ID. Always returns IMDb rating as the primary rating.")]
+        [return: Description("JSON object containing IMDb rating as the primary rating, with other ratings as additional context")]
+
         public async Task<string> GetMovieRating(
             [Description("The IMDb ID of the movie (e.g., 'tt1375666')")] string imdbId)
         {
@@ -45,7 +46,7 @@ namespace MovieTracker.Backend.Prompts
         }
 
         [KernelFunction]
-        [Description("Compare IMDb ratings of multiple movies and find the highest rated one")]
+        [Description("Compare IMDb ratings of multiple movies and find the highest rated one. Always uses IMDb ratings for comparison.")]
         [return: Description("Comparison results showing which movie has the highest IMDb rating")]
         public async Task<string> CompareMovieRatings(
             [Description("Comma-separated list of IMDb IDs to compare (e.g., 'tt0068646,tt0071562,tt0099685')")] string imdbIds)
@@ -74,7 +75,7 @@ namespace MovieTracker.Backend.Prompts
         }
 
         [KernelFunction]
-        [Description("Filter a list of movies to only include those with IMDb ratings above a threshold")]
+        [Description("Filter movies by IMDb rating threshold. Always uses IMDb ratings for filtering.")]
         [return: Description("List of movies that meet the minimum IMDb rating requirement")]
         public async Task<string> FilterMoviesByRating(
             [Description("Comma-separated list of IMDb IDs to filter")] string imdbIds,
@@ -97,6 +98,36 @@ namespace MovieTracker.Backend.Prompts
                     BoxOffice = m.BoxOffice
                 }),
                 Summary = $"Found {qualifyingMovies.Count} out of {ids.Count} movies with IMDb rating {minimumRating}+"
+            });
+        }
+
+        [KernelFunction]
+        [Description("Get rating for a movie (uses IMDb rating as default). Use this when user asks about 'rating' without specifying the source.")]
+        [return: Description("Movie rating information with IMDb rating as the primary rating")]
+        public async Task<string> GetMovieRatingGeneric(
+            [Description("The IMDb ID of the movie")] string imdbId)
+        {
+            var result = await openMovieDbAgent.GetMovieRatings(imdbId);
+
+            if (!result.IsSuccess)
+            {
+                return JsonSerializer.Serialize(new { Error = result.ErrorMessage });
+            }
+
+            var imdbRatingDisplay = result.ImdbRating != "N/A" ? $"{result.ImdbRating}/10" : "not available";
+
+            return JsonSerializer.Serialize(new
+            {
+                Title = result.Title,
+                Year = result.Year,
+                Rating = $"IMDb rating: {imdbRatingDisplay}",
+                Note = "IMDb rating is used as the primary rating source",
+                AdditionalRatings = new
+                {
+                    RottenTomatoes = result.RottenTomatoesRating,
+                    Metacritic = result.MetacriticRating
+                },
+                Summary = $"{result.Title} ({result.Year}) has an IMDb rating of {imdbRatingDisplay}"
             });
         }
 

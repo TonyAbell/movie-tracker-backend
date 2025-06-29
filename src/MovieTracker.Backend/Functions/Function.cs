@@ -7,11 +7,8 @@ using Microsoft.SemanticKernel.Connectors.OpenAI;
 using Microsoft.SemanticKernel;
 using OpenTelemetry.Trace;
 using System.Text.Json.Serialization;
-using OpenAI.Chat;
 using System.Text.Json;
-using static MovieTracker.Backend.Prompts.TheMovieDBKernelFunctions;
 using Microsoft.Extensions.Caching.Distributed;
-using Microsoft.AspNetCore.DataProtection.KeyManagement;
 using TMDbLib.Client;
 using Microsoft.Extensions.Configuration;
 using MovieTracker.Backend.Prompts;
@@ -59,7 +56,8 @@ namespace MovieTracker.Backend.Functions
         bool Video,
         double VoteAverage,
         bool Favorite,
-        string ImdbId
+        string ImdbId,
+        MovieTrailerInfo? Trailer
     );
     public record MovieItem(string MovieId, string MovieName);
     public record LLMResponse(string SystemMessage, List<MovieItem> MovieList);
@@ -187,6 +185,23 @@ namespace MovieTracker.Backend.Functions
             }
         }
 
+        public MovieTrailerInfo? CreateTrailerInfo(TMDbLib.Objects.General.Video? tmdbVideo)
+        {
+            if (tmdbVideo == null || tmdbVideo.Site != "YouTube")
+                return null;
+
+            return new MovieTrailerInfo(
+                Key: tmdbVideo.Key,
+                Name: tmdbVideo.Name,
+                Site: tmdbVideo.Site,
+                Type: tmdbVideo.Type,
+                Official: tmdbVideo.Official,
+                YouTubeUrl: $"https://www.youtube.com/watch?v={tmdbVideo.Key}",
+                EmbedUrl: $"https://www.youtube.com/embed/{tmdbVideo.Key}",
+                ThumbnailUrl: $"https://img.youtube.com/vi/{tmdbVideo.Key}/maxresdefault.jpg"
+            );
+        }
+
         private async Task ProcessMovieAsync(JsonElement movie, List<MovieViewModel> movieItems, TMDbClient client)
         {
             var movieId = movie.GetProperty("MovieId").GetString();
@@ -213,6 +228,24 @@ namespace MovieTracker.Backend.Functions
                 var tmdbMovie = await client.GetMovieAsync(int.Parse(movieId));
                 var imdbId = tmdbMovie.ImdbId ?? "";
 
+                MovieTrailerInfo? trailerInfo = null;
+                try
+                {
+                    var videos = await client.GetMovieVideosAsync(int.Parse(movieId));
+                    var trailer = videos.Results
+                        .Where(v => v.Type == "Trailer" && v.Site == "YouTube")
+                        .OrderByDescending(v => v.Official)
+                        .ThenByDescending(v => v.Size)
+                        .FirstOrDefault();
+
+                    trailerInfo = CreateTrailerInfo(trailer);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogWarning($"Failed to get trailer for movie {movieId}: {ex.Message}");
+                    trailerInfo = null;
+                }
+
                 var movieViewModel = new MovieViewModel(
                     tmdbMovie.PosterPath,
                     tmdbMovie.Adult,
@@ -229,7 +262,8 @@ namespace MovieTracker.Backend.Functions
                     tmdbMovie.Video,
                     tmdbMovie.VoteAverage,
                     Favorite: false,
-                    imdbId
+                    imdbId,
+                    trailerInfo
                 );
 
                 lock (movieItems) // Thread-safe access to shared list

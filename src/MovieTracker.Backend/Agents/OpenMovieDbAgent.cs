@@ -5,6 +5,17 @@ using System.Globalization;
 
 namespace MovieTracker.Backend.Agents
 {
+    public record MovieTrailerInfo(
+        string Key,           // YouTube video ID (from TMDb "key" property)
+        string Name,          // Video title (from TMDb "name" property) 
+        string Site,          // "YouTube" or "Vimeo" (from TMDb "site" property)
+        string Type,          // "Trailer", "Teaser", "Clip", etc. (from TMDb "type" property)
+        bool Official,        // Official trailer flag (from TMDb "official" property)
+        string YouTubeUrl,    // Constructed: https://www.youtube.com/watch?v={Key}
+        string EmbedUrl,      // Constructed: https://www.youtube.com/embed/{Key}
+        string ThumbnailUrl   // Constructed: https://img.youtube.com/vi/{Key}/maxresdefault.jpg
+    );
+
     public record MovieRatingResult(
         string Title,
         string Year,
@@ -13,7 +24,8 @@ namespace MovieTracker.Backend.Agents
         string MetacriticRating,
         string BoxOffice,
         bool IsSuccess,
-        string ErrorMessage = ""
+        string ErrorMessage = "",
+        MovieTrailerInfo? Trailer = null
     );
 
     public record RatingComparisonResult(

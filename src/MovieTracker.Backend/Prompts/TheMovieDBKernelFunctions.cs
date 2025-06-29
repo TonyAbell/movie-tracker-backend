@@ -67,6 +67,125 @@ namespace MovieTracker.Backend.Prompts
         }
 
         [KernelFunction]
+        [Description("Get movie trailers, teasers, video clips, behind-the-scenes content, and interviews for a specific movie. Use this when users ask to 'show trailer', 'play trailer', 'watch video', 'preview movie', 'see teaser', 'video content', 'behind-the-scenes', or any video-related requests for a movie.")]
+        [return: Description("JSON object containing all available video content including trailers, teasers, clips, and behind-the-scenes footage")]
+        public async Task<string> GetMovieTrailers(
+        [Description("The TMDb movie ID")] string movieId)
+        {
+            TMDbClient client = new TMDbClient(apiKey);
+            var videos = await client.GetMovieVideosAsync(int.Parse(movieId));
+
+            var allVideos = videos.Results
+                .Where(v => v.Site == "YouTube")
+                .Select(v => new
+                {
+                    Name = v.Name,
+                    Type = v.Type, // "Trailer", "Teaser", "Clip", "Behind the Scenes", "Featurette"
+                    Key = v.Key,
+                    YouTubeUrl = $"https://www.youtube.com/watch?v={v.Key}",
+                    EmbedUrl = $"https://www.youtube.com/embed/{v.Key}",
+                    ThumbnailUrl = $"https://img.youtube.com/vi/{v.Key}/maxresdefault.jpg",
+                    Official = v.Official
+                })
+                .ToList();
+
+            var trailers = allVideos.Where(v => v.Type == "Trailer").ToList();
+            var teasers = allVideos.Where(v => v.Type == "Teaser").ToList();
+            var clips = allVideos.Where(v => v.Type == "Clip").ToList();
+            var behindScenes = allVideos.Where(v => v.Type == "Behind the Scenes").ToList();
+            var featurettes = allVideos.Where(v => v.Type == "Featurette").ToList();
+
+            var movie = await client.GetMovieAsync(int.Parse(movieId));
+
+            return JsonSerializer.Serialize(new
+            {
+                MovieTitle = movie.Title,
+                MovieYear = movie.ReleaseDate?.Year,
+                TotalVideoCount = allVideos.Count,
+                MainTrailer = trailers.FirstOrDefault(t => t.Official) ?? trailers.FirstOrDefault() ?? allVideos.FirstOrDefault(),
+                Videos = new
+                {
+                    Trailers = trailers,
+                    Teasers = teasers,
+                    Clips = clips,
+                    BehindTheScenes = behindScenes,
+                    Featurettes = featurettes
+                },
+                Summary = allVideos.Any()
+                    ? $"Found {allVideos.Count} video(s) for {movie.Title} including trailers, clips, and behind-the-scenes content"
+                    : $"No video content available for {movie.Title}"
+            });
+        }
+
+        [KernelFunction]
+        [Description("Get movie information with trailer included for inline chat display. Use when users ask to 'show movie', 'tell me about movie', or want general movie info that should include a trailer preview.")]
+        [return: Description("Complete movie information with embedded trailer for chat display")]
+        public async Task<string> GetMovieWithTrailer(
+            [Description("The TMDb movie ID")] string movieId)
+        {
+            TMDbClient client = new TMDbClient(apiKey);
+            var movie = await client.GetMovieAsync(int.Parse(movieId));
+            var videos = await client.GetMovieVideosAsync(int.Parse(movieId));
+
+            var trailer = videos.Results
+                .Where(v => v.Type == "Trailer" && v.Site == "YouTube")
+                .OrderByDescending(v => v.Official)
+                .FirstOrDefault();
+
+            return JsonSerializer.Serialize(new
+            {
+                MovieId = movieId,
+                Title = movie.Title,
+                Overview = movie.Overview,
+                ReleaseDate = movie.ReleaseDate?.ToString("yyyy-MM-dd"),
+                ImdbId = movie.ImdbId ?? "",
+                DisplayType = "movie-with-inline-trailer",
+                Trailer = trailer != null ? new
+                {
+                    HasTrailer = true,
+                    Name = trailer.Name,
+                    YouTubeUrl = $"https://www.youtube.com/watch?v={trailer.Key}",
+                    EmbedUrl = $"https://www.youtube.com/embed/{trailer.Key}",
+                    ThumbnailUrl = $"https://img.youtube.com/vi/{trailer.Key}/maxresdefault.jpg",
+                    DisplayInline = true,
+                    AllowFullScreen = true
+                } : new
+                {
+                    HasTrailer = false,
+                    Name = "No trailer available",
+                    YouTubeUrl = "",
+                    EmbedUrl = "",
+                    ThumbnailUrl = "",
+                    DisplayInline = false,
+                    AllowFullScreen = false
+                },
+                ChatMessage = trailer != null
+                    ? "Here's the movie info with trailer - tap to watch full screen!"
+                    : "Here's the movie info (no trailer available)"
+            });
+        }
+
+        [KernelFunction]
+        [Description("Handle generic video/trailer requests when context is unclear. Use for queries like 'trailer please', 'play trailer', 'watch video', 'movie trailer?' when no specific movie is mentioned.")]
+        [return: Description("Response asking for clarification about which movie trailer they want")]
+        public async Task<string> HandleGenericTrailerRequest(
+            [Description("The user's generic trailer request")] string userQuery)
+        {
+            return JsonSerializer.Serialize(new
+            {
+                Type = "clarification-needed",
+                Message = "I'd be happy to show you a trailer! Which movie are you interested in?",
+                Suggestions = new[]
+                {
+            "Try: 'Show me the Inception trailer'",
+            "Or: 'Play the Batman trailer'",
+            "Or: 'Trailer for Top Gun Maverick'"
+        },
+                FollowUp = "Just tell me the movie name and I'll find the trailer for you!"
+            });
+        }
+
+        [KernelFunction]
         [Description("Get detailed information about a specific movie by its ID.")]
         [return: Description("Detailed information about the movie, including title, overview, release date, genres, runtime, and ImdbId.")]
         public async Task<string> GetMovieDetails(
@@ -113,7 +232,6 @@ namespace MovieTracker.Backend.Prompts
             TMDbClient client = new TMDbClient(apiKey);
             var movie = await client.GetMovieAsync(int.Parse(movieId));
 
-            // Create an object to hold relevant movie data
             var movieData = new
             {
                 MovieId = movieId,
@@ -129,7 +247,6 @@ namespace MovieTracker.Backend.Prompts
                 Cast = (await client.GetMovieCreditsAsync(movie.Id))?.Cast.Take(5).Select(c => c.Name).ToList() // Top 5 cast members
             };
 
-            // Serialize the movie data to JSON
             string movieJson = JsonSerializer.Serialize(movieData, new JsonSerializerOptions
             {
                 WriteIndented = true

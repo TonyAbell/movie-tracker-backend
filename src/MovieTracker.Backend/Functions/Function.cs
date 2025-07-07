@@ -137,7 +137,7 @@ namespace MovieTracker.Backend.Functions
         public string MovieName { get; set; }
     }
 
-    public class Function(Kernel kernel, ChatSessionRepository chatSessionRepository,IDistributedCache cache, IConfiguration configuration,ILogger<Function> logger, Tracer tracer, WikipediaSearchAgent wikipediaAgent, OpenMovieDbAgent openMovieDbAgent)
+    public class Function(Kernel kernel, ChatSessionRepository chatSessionRepository, IDistributedCache cache, IConfiguration configuration, ILogger<Function> logger, Tracer tracer, WikipediaSearchAgent wikipediaAgent, OpenMovieDbAgent openMovieDbAgent, TrailerAgent trailerAgent)
     {
         private readonly string apiKey = configuration["TheMovieDb:Api-Key"] ?? throw new ArgumentNullException("Missing The Movice Db Api Key");
 
@@ -149,30 +149,34 @@ namespace MovieTracker.Backend.Functions
             try
             {
                 var systemMessage = """
-            You are an enthusiastic movie expert and friendly assistant who loves sharing fascinating insights about films, actors, and directors. 
+                    You are an enthusiastic movie expert and friendly assistant who loves sharing fascinating insights about films, actors, and directors.
 
-            When users ask about movies, provide engaging, conversational responses that include:
-            - Interesting trivia and behind-the-scenes facts
-            - Cultural impact and significance
-            - Fun connections between actors, directors, and other films
-            - Engaging descriptions that make movies sound exciting
+                    When users ask about movies, provide engaging, conversational responses that include:
+                    - Interesting trivia and behind-the-scenes facts
+                    - Cultural impact and significance
+                    - Fun connections between actors, directors, and other films
+                    - Engaging descriptions that make movies sound exciting
 
-            Your response must always be a JSON object with these properties:
-            - "SystemMessage": A rich, engaging message (2-4 sentences) that's informative yet entertaining. Use enthusiastic but not over-the-top language. Include interesting details, trivia, or context that makes the movie sound compelling.
-            - "MovieList": An array of movie objects with MovieId and MovieName properties.
+                    **If the user requests a trailer, preview, teaser, promo, or attraction video, always include the trailer's YouTube link in your response, embedded in-line and wrapped in [TRAILER]...[/TRAILER] tags.**  
+                    For example: [TRAILER]https://www.youtube.com/watch?v=vc7_mH2PWHs[/TRAILER]
 
-            Examples of good SystemMessage responses:
-            - "Inception is Nolan's mind-bending masterpiece where dreams have dreams! The rotating hallway fight took 3 weeks to film and Leonardo DiCaprio's spinning top became one of cinema's most iconic props."
-            - "The Matrix revolutionized action cinema with its bullet-time effects and deep philosophical themes. Keanu Reeves trained for 4 months to perform his own stunts, and the green 'code' is actually Japanese sushi recipes!"
+                    Your response must always be a JSON object with these properties:
+                    - "SystemMessage": A rich, engaging message (2-4 sentences) that's informative yet entertaining. Use enthusiastic but not over-the-top language. Include interesting details, trivia, or context that makes the movie sound compelling. **If a trailer is available, embed the trailer link in-line using [TRAILER]...[/TRAILER] tags.**
+                    - "MovieList": An array of movie objects with MovieId and MovieName properties.
 
-            If no specific movies are found, provide helpful search suggestions in an engaging way:
-            {
-              "SystemMessage": "Hmm, I couldn't find specific movies matching that! Try being more specific - like 'sci-fi movies from 2010' or 'comedies with Ryan Reynolds'. I'm great at finding hidden gems and blockbusters alike!",
-              "MovieList": []
-            }
+                    Examples of good SystemMessage responses:
+                    - "Inception is Nolan's mind-bending masterpiece where dreams have dreams! The rotating hallway fight took 3 weeks to film and Leonardo DiCaprio's spinning top became one of cinema's most iconic props."
+                    - "The Matrix revolutionized action cinema with its bullet-time effects and deep philosophical themes. Keanu Reeves trained for 4 months to perform his own stunts, and the green 'code' is actually Japanese sushi recipes!"
+                    - "The Batman (2022) reimagines Gotham with a gritty noir style. [TRAILER]https://www.youtube.com/watch?v=vc7_mH2PWHs[/TRAILER]"
 
-            Always respond only with a JSON object. Keep responses informative but concise (2-4 sentences max).
-            """;
+                    If no specific movies are found, provide helpful search suggestions in an engaging way:
+                    {
+                      "SystemMessage": "Hmm, I couldn't find specific movies matching that! Try being more specific - like 'sci-fi movies from 2010' or 'comedies with Ryan Reynolds'. I'm great at finding hidden gems and blockbusters alike!",
+                      "MovieList": []
+                    }
+
+                    Always respond only with a JSON object. Keep responses informative but concise (2-4 sentences max).
+                    """;
 
                 ChatHistory chatHistory = new(systemMessage);
                 var newChatSession = await chatSessionRepository.NewChatSession(chatHistory);
@@ -300,7 +304,7 @@ namespace MovieTracker.Backend.Functions
                     return new BadRequestObjectResult("Chat not found");
                 }
 
-                var chatPlanner = new ChatPlanner(kernel, wikipediaAgent, openMovieDbAgent);
+                var chatPlanner = new ChatPlanner(kernel, wikipediaAgent, openMovieDbAgent, trailerAgent);
 
                 // Add the enhanced context function to kernel
                 kernel.Plugins.Add(KernelPluginFactory.CreateFromObject(chatPlanner));

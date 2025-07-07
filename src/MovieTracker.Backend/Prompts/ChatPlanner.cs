@@ -11,18 +11,31 @@ namespace MovieTracker.Backend.Prompts
         private readonly Kernel kernel;
         private readonly WikipediaSearchAgent wikipediaAgent;
         private readonly OpenMovieDbAgent openMovieDbAgent;
+        private readonly TrailerAgent trailerAgent;
 
-        public ChatPlanner(Kernel kernel, WikipediaSearchAgent wikipediaAgent, OpenMovieDbAgent openMovieDbAgent)
+        public ChatPlanner(Kernel kernel, WikipediaSearchAgent wikipediaAgent, OpenMovieDbAgent openMovieDbAgent, TrailerAgent trailerAgent)
         {
             this.kernel = kernel;
             this.wikipediaAgent = wikipediaAgent;
             this.openMovieDbAgent = openMovieDbAgent;
+            this.trailerAgent = trailerAgent;
+        }
+
+        [KernelFunction]
+        [Description("Handle trailer requests and return clickable trailer links")]
+        public async Task<string> HandleTrailerRequest(string userQuery)
+        {
+            if (trailerAgent.CanHandle(userQuery))
+            {
+                return await trailerAgent.HandleRequest(userQuery);
+            }
+
+            return await GenerateRequiredSteps();
         }
 
         [KernelFunction]
         [Description("Get movie rating (defaults to IMDb rating) for a specific movie using its IMDb ID. Always returns IMDb rating as the primary rating.")]
         [return: Description("JSON object containing IMDb rating as the primary rating, with other ratings as additional context")]
-
         public async Task<string> GetMovieRating(
             [Description("The IMDb ID of the movie (e.g., 'tt1375666')")] string imdbId)
         {
@@ -203,13 +216,11 @@ namespace MovieTracker.Backend.Prompts
             var detectionResult = await chatService.GetChatMessageContentAsync(entityDetectionPrompt);
             var detectedEntity = detectionResult.Content?.Trim() ?? "NONE";
 
-            // If no entity detected, return null
             if (detectedEntity.ToUpper() == "NONE")
             {
                 return null;
             }
 
-            // Generate a funny fact about the detected entity
             var funnyFactPrompt = $@"
             Generate ONE interesting, entertaining, or funny fact about '{detectedEntity}'.
             The fact should be concise, surprising, and relevant to movies or acting if possible.
@@ -230,7 +241,6 @@ namespace MovieTracker.Backend.Prompts
         [return: Description("The list of steps to best respond to the user")]
         public async Task<string> GenerateRequiredSteps()
         {
-            // Prompt the LLM to generate a list of steps to complete the task
             string prompt = $$"""
                 Return a json object with the following properties:
                 SystemMessage: A message to the user, relevant to their request, if no movies are found, 
@@ -249,7 +259,6 @@ namespace MovieTracker.Backend.Prompts
                 }
                 """;
 
-            // Return the plan back to the agent
             return prompt.ToString();
         }
 

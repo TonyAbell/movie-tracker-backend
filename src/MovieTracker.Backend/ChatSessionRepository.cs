@@ -8,6 +8,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
+using MovieTracker.Backend.Functions;
 using ChatMessage = Microsoft.Extensions.AI.ChatMessage;
 
 namespace MovieTracker.Backend
@@ -24,6 +25,14 @@ namespace MovieTracker.Backend
         // created before this migration cannot be loaded.
         public List<ChatMessage> ChatHistory { get; set; }
         public string? FunnyFact { get; set; }
+
+        // Every movie this session has ever shown, already hydrated from TMDb, keyed by TMDb id.
+        // Chat-Ask replays the whole transcript back to the frontend on every call, so without this
+        // it re-fetched details + videos for every movie in every past turn - two TMDb round trips
+        // per movie, growing with conversation length. The IDistributedCache in front of it is
+        // AddDistributedMemoryCache, so it is per-instance and cold after every scale-out or restart;
+        // this is the copy that actually survives. Bounded by HydratedMovieLimit in Chat-Ask.
+        public Dictionary<string, MovieViewModel>? HydratedMovies { get; set; }
     }
 
     public class ChatSessionRepository(CosmosClient cosmosClient, ILogger<ChatSessionRepository> logger, Tracer tracer)
@@ -83,45 +92,9 @@ namespace MovieTracker.Backend
             }
         }
 
-        public async Task<MoviceTrackerChatSession> UpdateChatSession(string id, List<ChatMessage> chatHistory)
-        {
-            using var activity = tracer.StartActiveSpan("movie-tracker-func.chat-session-repository.update-chat-session");
-            try
-            {
-                var response = await chatHistoryContainer.ReadItemAsync<MoviceTrackerChatSession>(id, new PartitionKey(id));
-                MoviceTrackerChatSession movieChatSession = response.Resource;
-                movieChatSession.ChatHistory = chatHistory;
-                var updateResponse = await chatHistoryContainer.ReplaceItemAsync(movieChatSession, id, new PartitionKey(id));
-                return movieChatSession;
-            }
-            catch (Exception ex)
-            {
-                logger.LogCritical("{@ex}", ex);
-                throw;
-            }
-        }
-
-        public async Task<MoviceTrackerChatSession> UpdateChatSession(string id, List<ChatMessage> chatHistory, string? funnyFact)
-        {
-            using var activity = tracer.StartActiveSpan("movie-tracker-func.chat-session-repository.update-chat-session-with-funny-fact");
-            try
-            {
-                var response = await chatHistoryContainer.ReadItemAsync<MoviceTrackerChatSession>(id, new PartitionKey(id));
-                MoviceTrackerChatSession movieChatSession = response.Resource;
-                movieChatSession.ChatHistory = chatHistory;
-
-                movieChatSession.FunnyFact = funnyFact;
-
-                var updateResponse = await chatHistoryContainer.ReplaceItemAsync(movieChatSession, id, new PartitionKey(id));
-                return movieChatSession;
-            }
-            catch (Exception ex)
-            {
-                logger.LogCritical("{@ex}", ex);
-                throw;
-            }
-        }
-
+        // Chat-Ask already holds the document it loaded at the top of the request, so it writes the
+        // mutated instance straight back. The UpdateChatSession(id, ...) overloads this replaced did a
+        // ReadItemAsync first, which meant two Cosmos round trips per /ask to save one turn.
         public async Task<MoviceTrackerChatSession> SaveChatSession(MoviceTrackerChatSession movieChatSession)
         {
             using var activity = tracer.StartActiveSpan("movie-tracker-func.chat-session-repository.save-chat-session");

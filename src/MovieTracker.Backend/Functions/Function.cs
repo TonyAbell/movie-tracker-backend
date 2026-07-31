@@ -3,8 +3,10 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Logging;
 using Microsoft.Agents.AI;
+using Microsoft.Agents.AI.Compaction;
 using Microsoft.Extensions.AI;
 using OpenTelemetry.Trace;
+using System.Collections.Concurrent;
 using System.Text.Json.Serialization;
 using System.Text.Json;
 using Microsoft.Extensions.Caching.Distributed;
@@ -111,6 +113,11 @@ namespace MovieTracker.Backend.Functions
 
     public record ChatMessageResponse(string? FunnyFact, List<ChatMessage> Messages);
 
+    // Returned by Chat-Ask-V2 only. The v1 shape replays the entire hydrated transcript on every
+    // turn, so its payload and its hydration cost both grow with conversation length even though the
+    // caller already has every earlier turn. This carries just the turn that was produced.
+    public record ChatTurnResponse(string? FunnyFact, ChatMessage Turn);
+
     public class ChatSession
     {
         public string Id { get; set; }
@@ -180,6 +187,80 @@ namespace MovieTracker.Backend.Functions
         // outright. Leave the setting unset, empty, or "default" to omit it from the request.
         private readonly string? reasoningEffort = configuration["AzureOpenAi:Reasoning-Effort"];
 
+        // What is STORED and what is SENT are deliberately different. Cosmos keeps every message
+        // forever because the /ask contract replays the whole transcript back to the frontend; the
+        // model only ever sees this compacted view.
+        //
+        // Tool results dominate the token count - one DiscoverMovies call returns twenty full movie
+        // records - and they are dead weight once the assistant has written its answer, because the
+        // ids and titles a follow-up needs ("which of those had the highest rating?") are already in
+        // that answer's JSON. ToolResultCompactionStrategy collapses each old assistant-call +
+        // tool-result group into a single line recording what was called, and leaves user messages
+        // and assistant answers untouched. SlidingWindow is the backstop for genuinely long chats.
+        //
+        // Compaction always runs over the full stored history, never over its own output, so it never
+        // compounds: turn 20 sees exactly the same reduction of turns 1-10 that turn 11 saw.
+        private const int MaxModelTurns = 12;
+
+        // MAAI001 gates the whole Microsoft.Agents.AI.Compaction namespace as evaluation-only, the same
+        // way OPENAI001 gates ReasoningEffortLevel below. It is the one preview API this project takes a
+        // dependency on; the fallback if it changes shape is a hand-rolled filter over the same message
+        // list, since nothing outside RunTurnAsync can observe how the context was reduced.
+        // How much of an old tool result to keep when its group is collapsed. Enough to show the shape
+        // of what came back, not enough to pay for it twice.
+        private const int CollapsedToolResultChars = 160;
+
+        // AsChatReducer is the supported way to drive a CompactionStrategy over a plain message list -
+        // CompactionMessageIndex, which the strategies actually operate on, is not public. Each
+        // ReduceAsync builds its own index from the messages handed in and returns the included ones.
+#pragma warning disable MAAI001
+        private static readonly IChatReducer ContextReducer = new PipelineCompactionStrategy(
+        [
+            new ToolResultCompactionStrategy(
+                trigger: CompactionTriggers.HasToolCalls(),
+                // The current turn's own tool traffic stays verbatim - the model is still reasoning
+                // over it - and only earlier turns collapse.
+                minimumPreservedGroups: 2)
+            {
+                ToolCallFormatter = SummariseToolCalls,
+            },
+            new SlidingWindowCompactionStrategy(
+                trigger: CompactionTriggers.TurnsExceed(MaxModelTurns),
+                minimumPreservedTurns: 4),
+        ]).AsChatReducer();
+
+        // The built-in formatter inlines every tool result verbatim. That is sensible for a result like
+        // "Sunny and 72F" and close to useless here, where one DiscoverMovies call returns a twenty-movie
+        // JSON array: measured on a synthetic six-turn conversation the default saved 3% of the context,
+        // and this saves 68%. What a later turn needs from an old lookup is that it happened and roughly
+        // what came back - the ids and titles that mattered are already in the assistant's own answer,
+        // which this never touches.
+        private static string SummariseToolCalls(CompactionMessageGroup group)
+        {
+            var results = new Dictionary<string, string>();
+            foreach (var result in group.Messages.SelectMany(message => message.Contents).OfType<FunctionResultContent>())
+            {
+                results[result.CallId] = result.Result?.ToString() ?? string.Empty;
+            }
+
+            var lines = new List<string> { "[Earlier tool calls]" };
+            foreach (var call in group.Messages.SelectMany(message => message.Contents).OfType<FunctionCallContent>())
+            {
+                var text = results.TryGetValue(call.CallId, out var result) ? result : string.Empty;
+
+                lines.Add(text.Length <= CollapsedToolResultChars
+                    ? $"{call.Name}: {text}"
+                    : $"{call.Name}: {text[..CollapsedToolResultChars]}... [{text.Length - CollapsedToolResultChars} more chars elided]");
+            }
+
+            return string.Join("\n", lines);
+        }
+#pragma warning restore MAAI001
+
+        // The per-session hydrated-movie map rides along in the Cosmos document, so it is bounded to
+        // keep the document well clear of the 2 MB item limit. A MovieViewModel is ~1-2 KB once the
+        // overview and trailer metadata are in it.
+        private const int HydratedMovieLimit = 150;
 
         [Function("Chat-Start")]
         public async Task<IActionResult> Start([HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "chat/start")] HttpRequest req)
@@ -207,7 +288,17 @@ namespace MovieTracker.Backend.Functions
                     - Populate MovieList with every relevant movie you found. Return an empty MovieList only
                       when the functions genuinely came back with no matches.
 
-                    **If the user requests a trailer, preview, teaser, promo, or attraction video, always include the trailer's YouTube link in your response, embedded in-line and wrapped in [TRAILER]...[/TRAILER] tags.**  
+                    **Ratings - IMDb is the default:**
+                    - When the user asks about a "rating", "score", or which film was "highest rated"
+                      without naming a source, they mean the IMDb rating. Call GetMovieRating for one
+                      film, or CompareMovieRatings for several, and answer from what it returns.
+                    - TMDb search and detail results carry a TmdbVoteAverage. That is not the rating.
+                      Never answer a rating question from it, and never present it as "the rating".
+                    - Rotten Tomatoes and Metacritic are secondary context; name the source if you cite them.
+                    - Report what a function returned in your own words. Never paste raw JSON from a
+                      function result into SystemMessage - the user sees that text verbatim.
+
+                    **If the user requests a trailer, preview, teaser, promo, or attraction video, always include the trailer's YouTube link in your response, embedded in-line and wrapped in [TRAILER]...[/TRAILER] tags.**
                     For example: [TRAILER]https://www.youtube.com/watch?v=vc7_mH2PWHs[/TRAILER]
 
                     Your response must always be a JSON object with these properties:
@@ -258,11 +349,15 @@ namespace MovieTracker.Backend.Functions
 
         // These run under Task.WhenAll, so one unresolvable movie would otherwise fail the
         // entire response. Hydration of a single entry is best-effort.
-        private async Task SafeProcessMovieAsync(JsonElement movie, List<MovieViewModel> movieItems, TMDbClient client)
+        private async Task SafeProcessMovieAsync(
+            JsonElement movie,
+            List<MovieViewModel> movieItems,
+            TMDbClient client,
+            ConcurrentDictionary<string, MovieViewModel> sessionCache)
         {
             try
             {
-                await ProcessMovieAsync(movie, movieItems, client);
+                await ProcessMovieAsync(movie, movieItems, client, sessionCache);
             }
             catch (Exception ex)
             {
@@ -270,7 +365,11 @@ namespace MovieTracker.Backend.Functions
             }
         }
 
-        private async Task ProcessMovieAsync(JsonElement movie, List<MovieViewModel> movieItems, TMDbClient client)
+        private async Task ProcessMovieAsync(
+            JsonElement movie,
+            List<MovieViewModel> movieItems,
+            TMDbClient client,
+            ConcurrentDictionary<string, MovieViewModel> sessionCache)
         {
             if (!movie.TryGetProperty("MovieId", out var movieIdElement))
             {
@@ -290,12 +389,27 @@ namespace MovieTracker.Backend.Functions
                 return;
             }
 
+            // Tier 1: this session's own document, which is already in memory from the load at the
+            // top of the request and survives instance restarts and scale-out. Replayed turns hit
+            // here, which is what makes hydration cost O(this turn) rather than O(conversation).
+            if (sessionCache.TryGetValue(movieId, out var cachedForSession))
+            {
+                lock (movieItems)
+                {
+                    movieItems.Add(cachedForSession);
+                }
+                return;
+            }
+
+            // Tier 2: the process-wide IDistributedCache. Shared across sessions on this instance,
+            // but AddDistributedMemoryCache means it is cold on every new instance.
             var dataInBytes = await cache.GetAsync(movieId);
             if (dataInBytes != null)
             {
                 var movieViewModel = JsonSerializer.Deserialize<MovieViewModel>(dataInBytes);
                 if (movieViewModel != null)
                 {
+                    sessionCache[movieId] = movieViewModel;
                     lock (movieItems) // Thread-safe access to shared list
                     {
                         movieItems.Add(movieViewModel);
@@ -345,6 +459,8 @@ namespace MovieTracker.Backend.Functions
                     trailerInfo
                 );
 
+                sessionCache[movieId] = movieViewModel;
+
                 lock (movieItems) // Thread-safe access to shared list
                 {
                     movieItems.Add(movieViewModel);
@@ -353,6 +469,190 @@ namespace MovieTracker.Backend.Functions
                 var movieViewModelBytes = JsonSerializer.SerializeToUtf8Bytes(movieViewModel);
                 await cache.SetAsync(movieId, movieViewModelBytes);
             }
+        }
+
+        // Turns one stored conversation message into the frontend shape, hydrating any movie ids it
+        // carries. Returns null for the messages the contract does not surface: the system prompt and
+        // the intermediate function-call / function-result messages, which have no text.
+        private async Task<ChatMessage?> ToClientMessageAsync(
+            AIChatMessage message,
+            TMDbClient client,
+            ConcurrentDictionary<string, MovieViewModel> sessionCache)
+        {
+            var text = message.Text;
+            if (string.IsNullOrEmpty(text))
+            {
+                return null;
+            }
+
+            if (message.Role == ChatRole.User)
+            {
+                return new UserChatMessage(text);
+            }
+
+            if (message.Role != ChatRole.Assistant)
+            {
+                return null;
+            }
+
+            text = text.Replace("```json", "").Replace("```", "");
+            List<MovieViewModel> movieItems = new List<MovieViewModel>();
+
+            try
+            {
+                JsonDocument doc = JsonDocument.Parse(text);
+                var root = doc.RootElement;
+                var systemMessage = root.GetProperty("SystemMessage").GetString();
+
+                if (root.TryGetProperty("MovieList", out JsonElement movieList))
+                {
+                    var tasks = new List<Task>();
+                    foreach (var movie in movieList.EnumerateArray())
+                    {
+                        tasks.Add(SafeProcessMovieAsync(movie, movieItems, client, sessionCache));
+                    }
+
+                    await Task.WhenAll(tasks);
+                }
+
+                return new AssistantChatMessage(systemMessage, movieItems);
+            }
+            catch (JsonException)
+            {
+                return new AssistantChatMessage("No movies were found", movieItems);
+            }
+        }
+
+        // Decorative, and now racing the model call rather than blocking it, so a Wikipedia outage
+        // must not take the turn down with it. Swallowing here also keeps the task from faulting
+        // while nothing is awaiting it, which the sequential version could not produce.
+        private async Task<string?> SafeGenerateFunnyFactAsync(string input)
+        {
+            try
+            {
+                return await chatPlanner.GenerateEnhancedFunnyFact(input);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Funny fact generation failed; answering without one");
+                return null;
+            }
+        }
+
+        // Azure Monitor's token metrics on the Cognitive Services account report 0 and the OpenTelemetry
+        // gen_ai.usage spans arrive only partially, so per-turn usage is logged here where it can be
+        // read straight out of App Insights. CachedInput is the one to watch: non-zero means the static
+        // system prompt, tool schemas and JSON schema are hitting Azure OpenAI's automatic prompt cache;
+        // a persistent zero means something started varying that prefix and the discount is being lost.
+        private void LogUsage(AgentResponse result)
+        {
+            if (result.Usage is not { } usage)
+            {
+                return;
+            }
+
+            logger.LogInformation(
+                "Chat-Ask usage: input={InputTokens} cachedInput={CachedInputTokens} output={OutputTokens} reasoning={ReasoningTokens} total={TotalTokens}",
+                usage.InputTokenCount,
+                usage.CachedInputTokenCount,
+                usage.OutputTokenCount,
+                usage.ReasoningTokenCount,
+                usage.TotalTokenCount);
+        }
+
+        private static ConcurrentDictionary<string, MovieViewModel> LoadHydrationCache(MoviceTrackerChatSession session) =>
+            session.HydratedMovies is null
+                ? new ConcurrentDictionary<string, MovieViewModel>()
+                : new ConcurrentDictionary<string, MovieViewModel>(session.HydratedMovies);
+
+        private async Task SaveSessionAsync(MoviceTrackerChatSession session, ConcurrentDictionary<string, MovieViewModel> sessionCache)
+        {
+            if (sessionCache.Count > HydratedMovieLimit)
+            {
+                // Only a document-size bound. Anything dropped is re-fetched from TMDb the next time
+                // it is replayed, so this costs latency on a very long conversation, never correctness.
+                logger.LogInformation(
+                    "Hydration cache for session {ChatId} holds {Count} movies; trimming to {Limit}",
+                    session.id, sessionCache.Count, HydratedMovieLimit);
+            }
+
+            session.HydratedMovies = sessionCache
+                .Take(HydratedMovieLimit)
+                .ToDictionary(entry => entry.Key, entry => entry.Value);
+
+            await chatSessionRepository.SaveChatSession(session);
+        }
+
+        // One conversational turn, shared by both routes: they differ only in how much of the
+        // conversation they hydrate afterwards. Appends the user message and everything the model
+        // produced onto the session's stored history and returns the final assistant message.
+        private async Task<AIChatMessage?> RunTurnAsync(MoviceTrackerChatSession chatSession, string input)
+        {
+            var chatMessages = chatSession.ChatHistory;
+
+            // The funny fact reads nothing but the user's raw input, yet it used to run to completion
+            // before the model call even started - an entity-detection completion, a Wikipedia REST
+            // fetch, a Wikidata SPARQL query and a second completion, all on the critical path. Kicked
+            // off here and collected after the answer comes back.
+            Task<string?> funnyFactTask = SafeGenerateFunnyFactAsync(input);
+
+            chatMessages.Add(new AIChatMessage(ChatRole.User, input));
+
+            // The agent already carries the tool set and invokes tools automatically, so only the
+            // per-call settings are built here. Run options are merged over the agent's defaults,
+            // and tool collections are unioned rather than replaced.
+            ChatOptions chatOptions = new()
+            {
+                ResponseFormat = MovieListResponseFormat,
+            };
+
+            if (!string.IsNullOrWhiteSpace(reasoningEffort)
+                && !string.Equals(reasoningEffort, "default", StringComparison.OrdinalIgnoreCase))
+            {
+                // Deliberately not ChatOptions.Reasoning: its ReasoningEffort enum only offers
+                // None/Low/Medium/High/ExtraHigh, and this setting has to be able to carry
+                // model-family-specific values such as "minimal". Dropping to the provider's own
+                // options type keeps the passthrough behaviour SK had.
+                // OPENAI001 gates ReasoningEffortLevel as evaluation-only, the same way SKEXP0010
+                // gated the structured-output ResponseFormat this method used to set.
+#pragma warning disable OPENAI001
+                chatOptions.RawRepresentationFactory = _ => new OpenAI.Chat.ChatCompletionOptions
+                {
+                    ReasoningEffortLevel = new OpenAI.Chat.ChatReasoningEffortLevel(reasoningEffort)
+                };
+#pragma warning restore OPENAI001
+            }
+
+            // Reduced over a copy on purpose. The reducer materialises whatever it is handed into the
+            // list its strategies then rewrite in place, and the stored history has to survive intact -
+            // if compaction reached it, the /ask transcript would quietly start losing turns.
+            var modelMessages = (await ContextReducer.ReduceAsync([.. chatMessages], default)).ToList();
+
+            logger.LogInformation(
+                "Chat-Ask context: sending {IncludedMessages} of {TotalMessages} stored messages to the model",
+                modelMessages.Count, chatMessages.Count);
+
+            // session: null runs the agent statelessly - the conversation is passed in on every call
+            // and the generated messages are appended back onto it. That is what the Semantic Kernel
+            // version did with a ChatHistory, and it is what lets the response be rebuilt by
+            // re-walking the stored conversation.
+            var result = await agent.RunAsync(modelMessages, null, new ChatClientAgentRunOptions(chatOptions));
+
+            LogUsage(result);
+
+            // Includes the intermediate function-call and function-result messages as well as the
+            // final answer. They carry no text, so the transcript skips them, but they must be
+            // persisted: a tool call without its result is an invalid conversation on the next turn.
+            chatMessages.AddRange(result.Messages);
+
+            var funnyFact = await funnyFactTask;
+            if (funnyFact != null)
+            {
+                chatSession.FunnyFact = funnyFact;
+            }
+
+            return result.Messages.LastOrDefault(
+                message => message.Role == ChatRole.Assistant && !string.IsNullOrEmpty(message.Text));
         }
 
         [Function("Chat-Ask")]
@@ -372,109 +672,75 @@ namespace MovieTracker.Backend.Functions
 
                 logger.LogDebug("Chat message received.");
                 var chatSession = await chatSessionRepository.GetChatSession(chatId);
-                var chatMessages = chatSession.ChatHistory;
 
-                if (chatMessages == null)
+                if (chatSession.ChatHistory == null)
                 {
                     return new BadRequestObjectResult("Chat not found");
                 }
 
-                //string? funnyFact = await chatPlanner.GenerateFunnyFact(ask.Input);
-                string? funnyFact = await chatPlanner.GenerateEnhancedFunnyFact(ask.Input);
+                var sessionCache = LoadHydrationCache(chatSession);
+                await RunTurnAsync(chatSession, ask.Input);
 
-                if (funnyFact != null)
-                {
-                    chatSession.FunnyFact = funnyFact;
-                }
-
-                chatMessages.Add(new AIChatMessage(ChatRole.User, ask.Input));
-
-                // The agent already carries the tool set and invokes tools automatically, so only the
-                // per-call settings are built here. Run options are merged over the agent's defaults,
-                // and tool collections are unioned rather than replaced.
-                ChatOptions chatOptions = new()
-                {
-                    ResponseFormat = MovieListResponseFormat,
-                };
-
-                if (!string.IsNullOrWhiteSpace(reasoningEffort)
-                    && !string.Equals(reasoningEffort, "default", StringComparison.OrdinalIgnoreCase))
-                {
-                    // Deliberately not ChatOptions.Reasoning: its ReasoningEffort enum only offers
-                    // None/Low/Medium/High/ExtraHigh, and this setting has to be able to carry
-                    // model-family-specific values such as "minimal". Dropping to the provider's own
-                    // options type keeps the passthrough behaviour SK had.
-                    // OPENAI001 gates ReasoningEffortLevel as evaluation-only, the same way SKEXP0010
-                    // gated the structured-output ResponseFormat this method used to set.
-#pragma warning disable OPENAI001
-                    chatOptions.RawRepresentationFactory = _ => new OpenAI.Chat.ChatCompletionOptions
-                    {
-                        ReasoningEffortLevel = new OpenAI.Chat.ChatReasoningEffortLevel(reasoningEffort)
-                    };
-#pragma warning restore OPENAI001
-                }
-
-                // session: null runs the agent statelessly - the entire conversation is passed in on
-                // every call and the generated messages are appended back onto it. That is exactly what
-                // the Semantic Kernel version did with a ChatHistory, and it is what lets the response
-                // below be rebuilt by re-walking the whole conversation.
-                var result = await agent.RunAsync(chatMessages, null, new ChatClientAgentRunOptions(chatOptions));
-
-                // Includes the intermediate function-call and function-result messages as well as the
-                // final answer. They carry no text, so the loop below skips them, but they must be
-                // persisted: a tool call without its result is an invalid conversation on the next turn.
-                chatMessages.AddRange(result.Messages);
-
+                // This route's contract is the whole transcript, every turn. The hydration cache is
+                // what keeps that from meaning a TMDb round trip per movie per turn.
                 var responseMessages = new List<ChatMessage>();
-                foreach (var messages in chatMessages)
+                foreach (var message in chatSession.ChatHistory)
                 {
-                    var text = messages.Text;
-                    if (messages.Role == ChatRole.Assistant && !String.IsNullOrEmpty(text))
+                    var clientMessage = await ToClientMessageAsync(message, client, sessionCache);
+                    if (clientMessage != null)
                     {
-                        text = text.Replace("```json", "").Replace("```", "");
-                        List<MovieViewModel> movieItems = new List<MovieViewModel>();
-
-                        try
-                        {
-                            System.Text.Json.JsonDocument doc = System.Text.Json.JsonDocument.Parse(text);
-                            var root = doc.RootElement;
-                            var systemMessage = root.GetProperty("SystemMessage").GetString();
-
-                            if (root.TryGetProperty("MovieList", out JsonElement movieList))
-                            {
-                                var movieListArray = movieList.EnumerateArray();
-                                var tasks = new List<Task>();
-
-                                foreach (var movie in movieListArray)
-                                {
-                                    tasks.Add(SafeProcessMovieAsync(movie, movieItems, client));
-                                }
-
-                                await Task.WhenAll(tasks);
-                            }
-
-                            AssistantChatMessage assistantChatMessage = new AssistantChatMessage(systemMessage, movieItems);
-                            responseMessages.Add(assistantChatMessage);
-                        }
-                        catch (JsonException)
-                        {
-                            var systemMessage = "No movies were found";
-                            AssistantChatMessage assistantChatMessage = new AssistantChatMessage(systemMessage, movieItems);
-                            responseMessages.Add(assistantChatMessage);
-                        }
-                    }
-
-                    if (messages.Role == ChatRole.User && !String.IsNullOrEmpty(text))
-                    {
-                        UserChatMessage userChatMessage = new UserChatMessage(text);
-                        responseMessages.Add(userChatMessage);
+                        responseMessages.Add(clientMessage);
                     }
                 }
 
-                await chatSessionRepository.UpdateChatSession(chatId, chatMessages, chatSession.FunnyFact);
+                await SaveSessionAsync(chatSession, sessionCache);
 
                 var response = new ChatMessageResponse(chatSession.FunnyFact, responseMessages);
                 return new OkObjectResult(response);
+            }
+            catch (Exception ex)
+            {
+                logger.LogCritical("{@ex}", ex);
+                return new BadRequestObjectResult(ex.Message);
+            }
+        }
+
+        // Same turn, same persistence, smaller answer: only the turn just produced is hydrated and
+        // returned. Additive - /api/chat/{chatId}/ask is untouched - and the two can be interleaved
+        // on one session, since both read and write the same stored history.
+        [Function("Chat-Ask-V2")]
+        public async Task<IActionResult> MessageV2(
+            [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "chat/{chatId}/ask/v2")] HttpRequest req,
+            string chatId)
+        {
+            using var activity = tracer.StartActiveSpan("movie-tracker-func.chat-ask-v2");
+            try
+            {
+                TMDbClient client = new TMDbClient(apiKey);
+                var ask = await req.ReadFromJsonAsync<Ask>();
+                if (ask == null)
+                {
+                    return new BadRequestObjectResult("Invalid request, missing ask object");
+                }
+
+                var chatSession = await chatSessionRepository.GetChatSession(chatId);
+
+                if (chatSession.ChatHistory == null)
+                {
+                    return new BadRequestObjectResult("Chat not found");
+                }
+
+                var sessionCache = LoadHydrationCache(chatSession);
+                var newAssistantMessage = await RunTurnAsync(chatSession, ask.Input);
+
+                ChatMessage turn = newAssistantMessage == null
+                    ? new AssistantChatMessage("No movies were found", [])
+                    : await ToClientMessageAsync(newAssistantMessage, client, sessionCache)
+                      ?? new AssistantChatMessage("No movies were found", []);
+
+                await SaveSessionAsync(chatSession, sessionCache);
+
+                return new OkObjectResult(new ChatTurnResponse(chatSession.FunnyFact, turn));
             }
             catch (Exception ex)
             {

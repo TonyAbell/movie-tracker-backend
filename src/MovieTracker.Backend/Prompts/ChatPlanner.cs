@@ -29,20 +29,40 @@ namespace MovieTracker.Backend.Prompts
         }
 
         /// <summary>
-        /// Explicit tool list; see the note on TheMovieDBKernelFunctions.CreateTools. This is the same
-        /// set of methods that carried [KernelFunction] before the migration.
+        /// Explicit tool list; see the note on TheMovieDBKernelFunctions.CreateTools.
         /// </summary>
+        /// <remarks>
+        /// Four of the ten methods that carried [KernelFunction] before the migration are deliberately
+        /// no longer offered to the model. They are still called - just not by it:
+        /// <list type="bullet">
+        /// <item><description>
+        /// <see cref="GenerateEnhancedFunnyFact"/> and <see cref="GenerateFunnyFact"/> are near-duplicates
+        /// of each other, and Chat-Ask already runs the enhanced one out of band for every request. As
+        /// tools they bought nothing and cost two nested completions plus Wikipedia and Wikidata calls,
+        /// inside a tool call the model was already waiting on. The fact reaches the client through the
+        /// response's own FunnyFact field, not through the conversation.
+        /// </description></item>
+        /// <item><description>
+        /// <see cref="GenerateRequiredSteps"/> returns a fixed string restating the JSON shape, which the
+        /// system prompt states and the strict structured-output schema then enforces. A round trip to be
+        /// told something the request already guarantees.
+        /// </description></item>
+        /// <item><description>
+        /// <see cref="GetMovieRatingGeneric"/> takes the same single IMDb id as <see cref="GetMovieRating"/>
+        /// and returns the same OMDb lookup with IMDb as the primary rating. Two descriptions for one
+        /// capability is just an ambiguous choice for the model to get wrong.
+        /// </description></item>
+        /// </list>
+        /// The date helpers in <see cref="DateTimeKernelFunctions"/> were left alone on purpose: their
+        /// schemas are tiny, and they exist precisely to stop the model inventing date ranges.
+        /// </remarks>
         public IEnumerable<AITool> CreateTools() =>
         [
             AIFunctionFactory.Create(HandleTrailerRequest),
             AIFunctionFactory.Create(GetMovieRating),
             AIFunctionFactory.Create(CompareMovieRatings),
             AIFunctionFactory.Create(FilterMoviesByRating),
-            AIFunctionFactory.Create(GetMovieRatingGeneric),
-            AIFunctionFactory.Create(GenerateEnhancedFunnyFact),
             AIFunctionFactory.Create(GetChatContext),
-            AIFunctionFactory.Create(GenerateFunnyFact),
-            AIFunctionFactory.Create(GenerateRequiredSteps),
             AIFunctionFactory.Create(GetMovieContext),
         ];
 
@@ -57,7 +77,16 @@ namespace MovieTracker.Backend.Prompts
             return await GenerateRequiredSteps();
         }
 
-        [Description("Get movie rating (defaults to IMDb rating) for a specific movie using its IMDb ID. Always returns IMDb rating as the primary rating.")]
+        // Absorbs the description GetMovieRatingGeneric used to carry, since that near-duplicate tool is
+        // no longer offered: the "user said rating without naming a source" case is the whole reason it
+        // existed, and IMDb-as-default is a deliberate choice for this app rather than an accident.
+        // The last sentence is load-bearing - without it the model will happily answer a rating question
+        // from a TMDb vote average already sitting in context instead of looking the rating up.
+        [Description("Get a movie's rating from its IMDb ID. Use this whenever the user asks about a rating, " +
+                     "score or 'which was highest rated' without naming a source: IMDb is the default rating. " +
+                     "Always returns the IMDb rating as the primary rating, with Rotten Tomatoes and Metacritic " +
+                     "as secondary context only. Prefer calling this over quoting any TMDb vote average that " +
+                     "appeared in earlier search or detail results.")]
         [return: Description("JSON object containing IMDb rating as the primary rating, with other ratings as additional context")]
         public async Task<string> GetMovieRating(
             [Description("The IMDb ID of the movie (e.g., 'tt1375666')")] string imdbId)

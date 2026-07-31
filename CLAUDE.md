@@ -49,31 +49,65 @@ CI does not build or test — `.github/workflows/pr-function.yml` deploys an eph
 
 ### Request flow
 
-Two HTTP functions, both in `Functions/Function.cs`:
+Three HTTP functions, all in `Functions/Function.cs`:
 
-- `Chat-Start` (`GET /api/chat/start`) — creates a `List<ChatMessage>` seeded with the **system prompt defined inline in this method**, persists it to Cosmos, returns a short `chatId`. That prompt is the contract for the whole app: it forces the model to reply with a JSON object of `SystemMessage` + `MovieList[{MovieId, MovieName}]`, and to wrap trailer URLs in `[TRAILER]...[/TRAILER]` for the frontend to render inline. Changing response shape means changing this prompt *and* the `MovieListResponse` type used as the structured-output schema.
-- `Chat-Ask` (`POST /api/chat/{chatId}/ask`) — loads the session, runs the planner, calls `agent.RunAsync(...)` with the `MovieListResponse` structured-output format, then **hydrates** the returned `MovieId`s.
+- `Chat-Start` (`GET /api/chat/start`) — creates a `List<ChatMessage>` seeded with the **system prompt defined inline in this method**, persists it to Cosmos, returns a short `chatId`. That prompt is the contract for the whole app: it forces the model to reply with a JSON object of `SystemMessage` + `MovieList[{MovieId, MovieName}]`, wrap trailer URLs in `[TRAILER]...[/TRAILER]` for the frontend to render inline, and treat **IMDb as the default rating** (see "Ratings default to IMDb" below). Changing response shape means changing this prompt *and* the `MovieListResponse` type used as the structured-output schema. The prompt is stored per session at `/start`, so edits only affect sessions created afterwards.
+- `Chat-Ask` (`POST /api/chat/{chatId}/ask`) — loads the session, runs the turn, then **hydrates** the returned `MovieId`s for the *entire* transcript, which is what this route returns.
+- `Chat-Ask-V2` (`POST /api/chat/{chatId}/ask/v2`) — identical turn and identical persistence, but returns `{ FunnyFact, Turn }` — only the assistant turn just produced, hydrated once. Purely additive; v1 is untouched and the two can be interleaved on one session because both read and write the same stored history.
+
+Both ask routes share `RunTurnAsync`. They differ only in how much of the conversation they hydrate afterwards.
 
 **Structured-output trap.** `MovieListResponseFormat` in `Function.cs` is built with `AIJsonUtilities.CreateJsonSchema` and `AIJsonSchemaTransformOptions { DisallowAdditionalProperties = true, RequireAllProperties = true }`, not with the obvious `ChatResponseFormat.ForJsonSchema(typeof(MovieListResponse), ...)`. The convenient overload emits a schema with no `required` array and no `additionalProperties: false`, which Azure OpenAI's strict structured outputs reject with HTTP 400 — Semantic Kernel's `ResponseFormat = typeof(T)` used to emit the strict dialect for you. The serializer options also pin `PropertyNamingPolicy = null`, because Microsoft.Extensions.AI defaults to camelCase and the system prompt and `ProcessMovieAsync` both depend on PascalCase `SystemMessage`/`MovieList`/`MovieId`.
 
-Hydration is the key two-layer design: the LLM only ever returns TMDb movie IDs; `ProcessMovieAsync` fans out over them, calls TMDbLib for full details plus the best YouTube trailer, and builds the `MovieViewModel` the frontend consumes. Results are cached per `movieId` in `IDistributedCache` (registered as `AddDistributedMemoryCache` — in-process, per-instance, no expiry set).
+Hydration is the key two-layer design: the LLM only ever returns TMDb movie IDs; `ProcessMovieAsync` fans out over them, calls TMDbLib for full details plus the best YouTube trailer, and builds the `MovieViewModel` the frontend consumes. Lookup is three tiers, in order:
 
-Note that `Chat-Ask` re-walks and re-hydrates the *entire* chat history on every call, so latency and TMDb calls grow with conversation length. A single `/ask` currently takes roughly 5–10s in production.
+1. `MoviceTrackerChatSession.HydratedMovies` — a `Dictionary<string, MovieViewModel>` **stored in the session's own Cosmos document**, so it arrives free with the load at the top of the request and survives restarts and scale-out. Capped at `HydratedMovieLimit` (150) purely to bound document size; anything evicted is simply re-fetched.
+2. `IDistributedCache` — `AddDistributedMemoryCache`, so process-wide and shared across sessions, but cold on every new instance.
+3. TMDb — two round trips per movie (details + videos).
+
+Tier 1 is what stops `/ask` re-fetching every movie of every past turn from TMDb on every call. Without it, TMDb traffic grows with conversation length and is cold on each new instance. A single `/ask` runs roughly 5–10s.
+
+**What is stored and what is sent are deliberately different.** Cosmos keeps every message forever because `/ask` replays the whole transcript to the frontend; the model sees a compacted view built per call by `ContextReducer`. See "Context compaction" below.
+
+The funny fact is generated **concurrently** with the main model call, not before it. It only reads the user's raw input, and running it first put two completions plus a Wikipedia REST fetch and a Wikidata SPARQL query on the critical path. `SafeGenerateFunnyFactAsync` swallows its own failures — decorative output must not fail the turn, and a task nobody awaits until later must not fault unobserved.
 
 Anything the model supplies — movie ids, release years, cast/genre/keyword id lists — is treated as untrusted input. It routinely invents non-numeric ids, so parsing goes through `TryGetTmdbId`/`ParseIdList` in `TheMovieDBKernelFunctions`, which hand the model a correctable error instead of throwing; `SafeProcessMovieAsync` isolates per-movie hydration so one bad entry cannot fail the whole response. A bare `int.Parse` on a model-supplied value is a bug waiting to happen.
 
-The named `"HttpClient"` in `Program.cs` is used **only** by the Azure OpenAI chat client (Cosmos takes the unnamed default), and its resilience timeouts are widened well past the 30s default because reasoning models are slow. They stay inside the platform's ~230s hard limit on HTTP triggers. It reaches the SDK through `AzureOpenAIClientOptions.Transport = new HttpClientPipelineTransport(httpClient)` — if that is dropped, the widened timeouts silently stop applying.
+The named `"HttpClient"` in `Program.cs` is used **only** by the Azure OpenAI chat client (Cosmos takes the unnamed default), and its resilience timeouts are widened well past the 30s default because reasoning models are slow. They stay inside the platform's ~230s hard limit on HTTP triggers. It reaches the SDK through `AzureOpenAIClientOptions.Transport = new HttpClientPipelineTransport(httpClient)` — if that is dropped, the widened timeouts silently stop applying. `Retry.MaxRetryAttempts` is 3 rather than the previous 1 because the funny-fact and main calls now fire together, which is burstier against the 200K TPM cap; the standard handler already counts 408/429/5xx as transient and honours `Retry-After`, so no custom predicate is needed.
+
+### Context compaction
+
+`ContextReducer` in `Function.cs` reduces the conversation *sent to the model* while the full history stays in Cosmos. It is a `PipelineCompactionStrategy` of `ToolResultCompactionStrategy` (collapse old tool-call groups) then `SlidingWindowCompactionStrategy` (drop oldest turns past `MaxModelTurns`), bridged to a plain message list with `.AsChatReducer()`.
+
+Things worth knowing before touching it:
+
+- **`CompactionMessageIndex` is not public.** The strategies operate on it, but the only supported way to run one over a `List<ChatMessage>` is `AsChatReducer()`. There is no public `CompactionMessageIndex.Create`.
+- The whole `Microsoft.Agents.AI.Compaction` namespace is gated behind **`MAAI001`** (evaluation-only) and is the one preview API this project depends on. The pragmas are scoped, the way `OPENAI001` is around `ReasoningEffortLevel`.
+- **The default `ToolCallFormatter` is close to useless here.** It inlines every tool result verbatim, which is fine for `"Sunny and 72F"` and not for a twenty-movie `DiscoverMovies` array — measured on a synthetic six-turn conversation it reduced context by 3%. The custom `SummariseToolCalls` truncates each result to `CollapsedToolResultChars` and gets 68% on the same input (41% at two turns, 90% at thirty).
+- Reduction runs over a **copy** of the stored list. The strategies rewrite the list they are given; if that reached `chatSession.ChatHistory`, the `/ask` transcript would quietly start losing turns.
+- Compaction always runs over the full stored history, never over its own output, so it never compounds: turn 20 sees the same reduction of turns 1–10 that turn 11 saw.
+- Safe by construction, and verified: system message preserved, every user question and assistant answer preserved inside the window, and tool calls never separated from their results (the index groups an assistant call plus its results atomically).
+
+### Ratings default to IMDb
+
+IMDb-as-default is a deliberate product decision, and it is carried in three places that must agree — the system prompt's "Ratings" block, `ChatPlanner.GetMovieRating`'s `[Description]`, and the field names in the TMDb tool payloads. `DescribeMovie` used to return TMDb's vote average under the bare name `Rating`, which invited the model to answer "which had the highest rating?" straight from it; it is now `TmdbVoteAverage`.
+
+Measured on the same "Nolan sci-fi → which had the highest rating?" pair, six passes each: **3/6 answered from IMDb before these changes, 6/6 after.** The failure mode is pre-existing model non-determinism, not something the tool pruning introduced — confirm with a `git stash` A/B before concluding otherwise.
 
 ### Agent Framework wiring
 
 `Program.cs` registers two things as **scoped**:
 
 - `IChatClient` — `AzureOpenAIClient(...).GetChatClient(deployment).AsIChatClient()`, against **Azure OpenAI in Microsoft Foundry** (`gpt-5-4-mini`, see `infrastructure/ai-foundry.bicep`), wrapped in `.UseOpenTelemetry(..., EnableSensitiveData = true)`. `GetChatClient` returns the *OpenAI SDK* `ChatClient`, so `AsIChatClient()` is mandatory — omitting it is compile error CS1929.
-- `AIAgent` — `chatClient.AsAIAgent(...)` with the full tool list. `ChatClientAgent` decorates the chat client with automatic function invocation by default, which is what `ToolCallBehavior.AutoInvokeKernelFunctions` used to do.
+- `AIAgent` — `chatClient.AsAIAgent(...)` with the full tool list, then `.AsBuilder().Use(...).Build(...)`. `ChatClientAgent` decorates the chat client with automatic function invocation by default, which is what `ToolCallBehavior.AutoInvokeKernelFunctions` used to do.
+
+The `.Use(...)` is function-invocation middleware that caps the tool-calling loop at `MaxToolIterations` (12) by setting `FunctionInvocationContext.Terminate`. `FunctionInvokingChatClient` allows **40** iterations by default, which at a few seconds per round trip blows through the 120s HttpClient budget and then the ~230s trigger limit before it gives up — the caller gets a timeout instead of an answer. Note `AsBuilder().Build()` returns a **new** agent; registering the pre-builder one silently skips the middleware.
 
 **The split matters.** `ChatPlanner` and `TrailerAgent` take the bare `IChatClient`, *not* the agent, because their prompts (entity detection, funny facts, trailer-title extraction) must run without the agent's tool set and JSON response format. Under Semantic Kernel they resolved `IChatCompletionService` off the kernel for the same reason.
 
 There is no attribute-driven tool discovery any more. `Plugins.AddFromType<T>()` is replaced by explicit `CreateTools()` methods returning `IEnumerable<AITool>` built with `AIFunctionFactory.Create`, and `Program.cs` unions the three sources. **Adding a `[Description]`-annotated method without adding it to the matching `CreateTools()` leaves it invisible to the model** — this is the single easiest thing to get wrong.
+
+The model sees **23** tools. Four `ChatPlanner` methods are deliberately *not* offered, and the `CreateTools()` XML doc says why: `GenerateEnhancedFunnyFact` and `GenerateFunnyFact` (the app already runs the enhanced one out of band; as tools they cost two nested completions plus Wikipedia/Wikidata inside a call the model is waiting on, and the fact reaches the client through the response's own field), `GenerateRequiredSteps` (a fixed string restating a JSON shape the system prompt states and the strict schema enforces), and `GetMovieRatingGeneric` (same input and same lookup as `GetMovieRating`). The methods still exist and are still called — just not by the model. The seven date helpers were kept on purpose: their schemas are tiny and they exist precisely to stop the model inventing date ranges.
 
 - `Prompts/TheMovieDBKernelFunctions.cs` — the main TMDb surface (genres, person search, movie search, discover with filters, movie details, trailers/videos).
 - `Prompts/DateTimeKernelFunctions.cs` — relative-date helpers so the model can resolve "in the last 10 years" into ISO date ranges rather than hallucinating them. Static methods.
@@ -91,7 +125,9 @@ The class names still end in `KernelFunctions` for continuity with the file hist
 
 ### Persistence
 
-`ChatSessionRepository.cs` — Cosmos DB, database `database`, container `chat-sessions`, hardcoded. Document id doubles as the partition key; ids come from `GenId()` (base64 of 5 random bytes, regenerated until URL-safe-clean). The conversation is a `List<Microsoft.Extensions.AI.ChatMessage>` serialized straight into the document via `CosmosSystemTextJsonSerializer`.
+`ChatSessionRepository.cs` — Cosmos DB, database `database`, container `chat-sessions`, hardcoded. Document id doubles as the partition key; ids come from `GenId()` (base64 of 5 random bytes, regenerated until URL-safe-clean). The conversation is a `List<Microsoft.Extensions.AI.ChatMessage>` serialized straight into the document via `CosmosSystemTextJsonSerializer`, alongside `HydratedMovies` (see hydration tiers above).
+
+The ask routes mutate the document they loaded and call `SaveChatSession`. The old `UpdateChatSession(id, ...)` overloads did a `ReadItemAsync` first, so saving one turn cost two Cosmos round trips; they are gone.
 
 Two constraints on that serializer, both load-bearing:
 
@@ -159,4 +195,6 @@ A missing `OpenMovieDb:Api-Key` fails at DI resolution of `OpenMovieDbAgent`, wh
 
 ### Observability
 
-OpenTelemetry traces export to Azure Monitor. Every function and repository method opens a span named `movie-tracker-func.*` via the injected `Tracer`; keep that convention when adding operations. Model spans come from `.UseOpenTelemetry(loggerFactory, serviceName, o => o.EnableSensitiveData = true)` on the `IChatClient`, which replaced the `Microsoft.SemanticKernel.Experimental.GenAI.EnableOTelDiagnosticsSensitive` AppContext switch — prompts and completions still appear in traces. The activity source is `serviceName` itself, so it is covered by the existing `AddSource(serviceName)`; `Microsoft.Extensions.AI*` and `Microsoft.Agents.AI*` are registered alongside it for the `execute_tool` spans.
+OpenTelemetry traces export to Azure Monitor. Every function and repository method opens a span named `movie-tracker-func.*` via the injected `Tracer`; keep that convention when adding operations.
+
+`LogUsage` logs `input / cachedInput / output / reasoning / total` off `AgentResponse.Usage` each turn, and `RunTurnAsync` logs how many stored messages compaction actually sent. Azure Monitor's token metrics on the Cognitive Services account report 0 and the `gen_ai.usage` spans arrive only partially, so these logs are the usable measurement. **`cachedInput` is the one to watch:** non-zero means the static system prompt, tool schemas and JSON schema are hitting Azure OpenAI's automatic prompt cache; a persistent zero means something started varying that prefix and the discount is being lost. Note prompt caching lowers cost but **not** TPM — quota is estimated before the cache lookup — so only compaction relieves the 200K TPM ceiling. These are worker logs and do not appear in `func start` console output; read them in App Insights. Model spans come from `.UseOpenTelemetry(loggerFactory, serviceName, o => o.EnableSensitiveData = true)` on the `IChatClient`, which replaced the `Microsoft.SemanticKernel.Experimental.GenAI.EnableOTelDiagnosticsSensitive` AppContext switch — prompts and completions still appear in traces. The activity source is `serviceName` itself, so it is covered by the existing `AddSource(serviceName)`; `Microsoft.Extensions.AI*` and `Microsoft.Agents.AI*` are registered alongside it for the `execute_tool` spans.

@@ -79,8 +79,10 @@ module CosmosKVModule 'kv-secrets-cosmosdb.bicep' = {
   }
 }
 
-module OpenAiModule 'openai.bicep' = {
-  name: 'OpenAI_Deploy'
+// Formerly openai.bicep. Same underlying Cognitive Services account, upgraded in place from
+// kind 'OpenAI' to the Microsoft Foundry kind 'AIServices'.
+module AiFoundryModule 'ai-foundry.bicep' = {
+  name: 'AiFoundry_Deploy'
   params: {
     location: location
   }
@@ -89,8 +91,8 @@ module OpenAiModule 'openai.bicep' = {
 module OpenAiKVModule 'kv-secrets-openai.bicep' = {
   name: 'OpenAI_KeyVault_Secrets_Deploy'
   params: {
-    openAiAccountName: OpenAiModule.outputs.accountName
-    openAiDeploymentName: OpenAiModule.outputs.deploymentName
+    openAiAccountName: AiFoundryModule.outputs.accountName
+    openAiDeploymentName: AiFoundryModule.outputs.deploymentName
     vaultName: KeyVaultModule.outputs.vaultName
   }
 }

@@ -54,7 +54,7 @@ Two HTTP functions, both in `Functions/Function.cs`:
 
 Hydration is the key two-layer design: the LLM only ever returns TMDb movie IDs; `ProcessMovieAsync` fans out over them, calls TMDbLib for full details plus the best YouTube trailer, and builds the `MovieViewModel` the frontend consumes. Results are cached per `movieId` in `IDistributedCache` (registered as `AddDistributedMemoryCache` — in-process, per-instance, no expiry set).
 
-Note that `Chat-Ask` re-walks and re-hydrates the *entire* chat history on every call, so latency and TMDb calls grow with conversation length. A single `/ask` currently takes roughly 30–70s.
+Note that `Chat-Ask` re-walks and re-hydrates the *entire* chat history on every call, so latency and TMDb calls grow with conversation length. A single `/ask` currently takes roughly 5–10s in production.
 
 Anything the model supplies — movie ids, release years, cast/genre/keyword id lists — is treated as untrusted input. It routinely invents non-numeric ids, so parsing goes through `TryGetTmdbId`/`ParseIdList` in `TheMovieDBKernelFunctions`, which hand the model a correctable error instead of throwing; `SafeProcessMovieAsync` isolates per-movie hydration so one bad entry cannot fail the whole response. A bare `int.Parse` on a model-supplied value is a bug waiting to happen.
 
@@ -62,7 +62,7 @@ The named `"HttpClient"` in `Program.cs` is used **only** by the Kernel (Cosmos 
 
 ### Semantic Kernel wiring
 
-`Program.cs` registers `Kernel` as **scoped**, backed by **Azure OpenAI** (`AddAzureOpenAIChatCompletion`) against the `gpt-5-mini` deployment in `infrastructure/openai.bicep`, and adds two plugins at build time:
+`Program.cs` registers `Kernel` as **scoped**, backed by **Azure OpenAI in Microsoft Foundry** (`AddAzureOpenAIChatCompletion`) against the `gpt-5-4-mini` deployment in `infrastructure/ai-foundry.bicep`, and adds two plugins at build time:
 
 - `Prompts/TheMovieDBKernelFunctions.cs` — the main TMDb surface (genres, person search, movie search, discover with filters, movie details, trailers/videos).
 - `Prompts/DateTimeKernelFunctions.cs` — relative-date helpers so the model can resolve "in the last 10 years" into ISO date ranges rather than hallucinating them.
@@ -90,6 +90,7 @@ All secrets come from Key Vault at startup (`VaultUri` env var + `DefaultAzureCr
 | `AzureOpenAi:Endpoint` | `AzureOpenAi--Endpoint` | `kv-secrets-openai.bicep` |
 | `AzureOpenAi:Api-Key` | `AzureOpenAi--Api-Key` | `kv-secrets-openai.bicep` |
 | `AzureOpenAi:Deployment` | `AzureOpenAi--Deployment` | `kv-secrets-openai.bicep` |
+| `AzureOpenAi:Reasoning-Effort` | `AzureOpenAi--Reasoning-Effort` | `kv-secrets-openai.bicep` |
 | `TheMovieDb:Api-Key` | `TheMovieDb--Api-Key` | `key-vault.bicep` |
 | `OpenMovieDb:Api-Key` | `OpenMovieDb--Api-Key` | **not in Bicep — must be added manually** |
 | `ConnectionStrings:Cosmos` | `ConnectionStrings--Cosmos` | `kv-secrets-cosmosdb.bicep` |
@@ -97,7 +98,37 @@ All secrets come from Key Vault at startup (`VaultUri` env var + `DefaultAzureCr
 
 `OpenAi--Api-Key` (the direct OpenAI.com key) is still provisioned by `key-vault.bicep` but is no longer read by the app.
 
-The Azure OpenAI account lives in **westus**, not the resource group's westus2, which offers no OpenAI models. Model choice is constrained by per-subscription quota, not just availability — `az cognitiveservices usage list -l westus` shows which SKUs have a non-zero limit, and Batch SKUs are not usable for these interactive calls.
+The account lives in **westus**, not the resource group's westus2, which offers no OpenAI models. Model choice is constrained by per-subscription quota, not just availability — `az cognitiveservices usage list -l westus` shows which SKUs have a non-zero limit, and Batch SKUs are not usable for these interactive calls.
+
+### Microsoft Foundry (formerly the Azure OpenAI resource)
+
+The Cognitive Services account was upgraded in place from `kind: 'OpenAI'` to `kind: 'AIServices'` with `allowProjectManagement: true` (`infrastructure/ai-foundry.bicep`). The resource name, custom subdomain, `openai.azure.com` endpoint, API keys and existing deployments all survive the upgrade, so no application code changed. It is reversible by setting `kind` back to `OpenAI` after deleting any projects and non-OpenAI deployments.
+
+**Trap:** on an `AIServices` account, `properties.endpoint` returns the generic `https://<name>.cognitiveservices.azure.com/` FQDN, but Semantic Kernel appends `/openai/deployments/<deployment>/chat/completions`, which is served only on `openai.azure.com`. `kv-secrets-openai.bicep` therefore builds the endpoint from `customSubDomainName` instead of reading `properties.endpoint` — reverting that silently breaks every `Chat-Ask` call on the next `main.bicep` deployment.
+
+Do not set `disableLocalAuth: true` (as the Microsoft upgrade doc's sample does). The function app authenticates with an API key from Key Vault.
+
+**Why the upgrade was worth it:** the `OpenAI` kind can only deploy OpenAI models, and this subscription has **zero** quota for `gpt-4.1-nano` and `gpt-5-nano`, while `gpt-4.1-mini` is in a deprecating state and refuses new deployments. The `AIServices` kind additionally unlocks the `AIServices.*` quota buckets (grok, gpt-oss, Claude, DeepSeek, Mistral), which is the only route to anything cheaper or faster than `gpt-5-mini`.
+
+### Model selection
+
+`gpt-5-4-mini` (model `gpt-5.4-mini`) on **DataZoneStandard**, because this subscription has 0 GlobalStandard quota for it and 200K TPM on DataZoneStandard. `gpt-5-mini` stays deployed as a fallback — it holds the largest quota pool of any chat model here (500K TPM GlobalStandard) and costs nothing while idle.
+
+Measured head-to-head on this app's own system prompt and tool set (end-to-end, three benchmark queries):
+
+| Deployment | E2E | ~$/1k turns | Quota | Notes |
+|---|---|---|---|---|
+| `gpt-5-4-mini` | 29.8s | $2.16 | 200K TPM | chosen; best results |
+| `gpt-5-mini` (default effort) | 113.2s | $3.55 | 500K TPM | previous default |
+| `gpt-5-mini` + `minimal` effort | 67.3s | $0.53 | 500K TPM | cheapest, but returned a wrong film |
+| `grok-4-1-fast` | — | $0.48 | 50K TPM | **429s** under real load |
+| `gpt-oss-120b` | — | $0.47 | 5000K TPM | schema-valid but incoherent output |
+
+The dominant cost was hidden reasoning tokens, not the per-token rate: `gpt-5-mini` spent **1344 of its 1587 completion tokens per turn on reasoning**. `gpt-5.4-mini` emits none at default effort.
+
+`AzureOpenAi:Reasoning-Effort` sets `OpenAIPromptExecutionSettings.ReasoningEffort`. Leave it `default` (or empty) to omit the parameter. Valid values are model-family-specific — `minimal` works on `gpt-5-mini`, `none` is **rejected** on `gpt-5.4-mini` through the API version Semantic Kernel uses, and non-reasoning models such as `grok-4-1-fast-non-reasoning` reject the parameter outright. A wrong value fails every `Chat-Ask` with HTTP 400.
+
+`dynamicThrottlingEnabled` cannot be set on these deployments — the control plane rejects it for `DataZoneStandard`. Headroom comes from capacity instead. Anthropic models (`claude-haiku-4-5`) additionally require `ModelProviderData` (industry, organization name, country code) that the `az cognitiveservices` CLI does not expose, so deploying one needs the portal or a raw ARM call.
 
 A missing `OpenMovieDb:Api-Key` fails at DI resolution of `OpenMovieDbAgent`, which surfaces as a failure on every `Chat-Ask` call, not at startup.
 

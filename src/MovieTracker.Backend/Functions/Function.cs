@@ -141,6 +141,17 @@ namespace MovieTracker.Backend.Functions
     {
         private readonly string apiKey = configuration["TheMovieDb:Api-Key"] ?? throw new ArgumentNullException("Missing The Movice Db Api Key");
 
+        // Reasoning models spend most of their output budget on hidden reasoning tokens, and output
+        // tokens are the expensive ones. Measured against this app's own system prompt and tool set,
+        // gpt-5-mini emitted 1587 completion tokens per turn of which 1344 were reasoning (~21.7s);
+        // the identical turn at "minimal" emitted 75 completion tokens (~3.8s).
+        //
+        // This stays in configuration rather than hardcoded because the accepted values differ by
+        // model family - "minimal" on gpt-5/gpt-5-mini, "none" on gpt-5.1 and later - and models with
+        // no reasoning stage at all (grok-4-1-fast-non-reasoning, gpt-oss-120b) reject the parameter
+        // outright. Leave the setting unset, empty, or "default" to omit it from the request.
+        private readonly string? reasoningEffort = configuration["AzureOpenAi:Reasoning-Effort"];
+
 
         [Function("Chat-Start")]
         public async Task<IActionResult> Start([HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "chat/start")] HttpRequest req)
@@ -363,6 +374,11 @@ namespace MovieTracker.Backend.Functions
 #pragma warning disable SKEXP0010
                 openAIPromptExecutionSettings.ResponseFormat = typeof(MovieListResponse);
 #pragma warning restore SKEXP0010
+                if (!string.IsNullOrWhiteSpace(reasoningEffort)
+                    && !string.Equals(reasoningEffort, "default", StringComparison.OrdinalIgnoreCase))
+                {
+                    openAIPromptExecutionSettings.ReasoningEffort = reasoningEffort;
+                }
 
                 var result = await chatCompletionService.GetChatMessageContentsAsync(
                     chatMessages,

@@ -1,4 +1,4 @@
-using Microsoft.SemanticKernel;
+using Microsoft.Extensions.AI;
 using System;
 using System.ComponentModel;
 using System.Globalization;
@@ -7,18 +7,32 @@ namespace MovieTracker.Backend.Prompts
 {
     public class DateTimeKernelFunctions
     {
+        /// <summary>
+        /// Explicit tool list; see the note on TheMovieDBKernelFunctions.CreateTools.
+        /// These are static methods, so no instance is captured.
+        /// </summary>
+        public static IEnumerable<AITool> CreateTools() =>
+        [
+            AIFunctionFactory.Create(Today),
+            AIFunctionFactory.Create(ThisMonth),
+            AIFunctionFactory.Create(ThisYear),
+            AIFunctionFactory.Create(PastYearsRange),
+            AIFunctionFactory.Create(PastMonthsRange),
+            AIFunctionFactory.Create(PastDaysRange),
+            AIFunctionFactory.Create(OffsetDate),
+        ];
+
         // ---------- POINTS ----------
-        [KernelFunction, Description("Today in ISO format (YYYY-MM-DD)")]
+        [Description("Today in ISO format (YYYY-MM-DD)")]
         public static string Today() => DateTime.UtcNow.ToString("yyyy-MM-dd");
 
-        [KernelFunction, Description("This month (first day) in ISO format (YYYY-MM)")]
+        [Description("This month (first day) in ISO format (YYYY-MM)")]
         public static string ThisMonth() => DateTime.UtcNow.ToString("yyyy-MM");
 
-        [KernelFunction, Description("This year in ISO format (YYYY)")]
+        [Description("This year in ISO format (YYYY)")]
         public static string ThisYear() => DateTime.UtcNow.Year.ToString();
 
         // ---------- RANGES ----------
-        [KernelFunction]
         [Description("ISO-8601 interval for the past <years> full years up to today. " +
                      "Example: PastYearsRange(3) → 2022-06-13/2025-06-13")]
         public static string PastYearsRange(
@@ -30,7 +44,6 @@ namespace MovieTracker.Backend.Prompts
             return $"{start:yyyy-MM-dd}/{end:yyyy-MM-dd}";
         }
 
-        [KernelFunction]
         [Description("ISO-8601 interval for the past <months> full months up to today. " +
                      "Example: PastMonthsRange(6) → 2024-12-13/2025-06-13")]
         public static string PastMonthsRange(int months)
@@ -40,7 +53,6 @@ namespace MovieTracker.Backend.Prompts
             return $"{start:yyyy-MM-dd}/{end:yyyy-MM-dd}";
         }
 
-        [KernelFunction]
         [Description("ISO-8601 interval for the past <days> days up to today.")]
         public static string PastDaysRange(int days)
         {
@@ -50,7 +62,6 @@ namespace MovieTracker.Backend.Prompts
         }
 
         // ---------- GENERIC ----------
-        [KernelFunction]
         [Description("Offset any ISO date (YYYY-MM-DD) by N units. Units = d, m, y. " +
                      "Example: OffsetDate(\"2022-05-20\", 10, \"d\")")]
         public static string OffsetDate(

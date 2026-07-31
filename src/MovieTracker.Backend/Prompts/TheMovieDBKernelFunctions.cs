@@ -1,5 +1,5 @@
-﻿using Microsoft.Extensions.Configuration;
-using Microsoft.SemanticKernel;
+﻿using Microsoft.Extensions.AI;
+using Microsoft.Extensions.Configuration;
 using System.ComponentModel;
 using System.Text.Json;
 using TMDbLib.Client;
@@ -14,6 +14,27 @@ namespace MovieTracker.Backend.Prompts
     {
         private readonly string apiKey = configuration["TheMovieDb:Api-Key"] ?? throw new ArgumentNullException("Missing The Movice Db Api Key");
         private record MovieItem(string MovieId, string MovieName);
+
+        /// <summary>
+        /// The Agent Framework has no equivalent of SK's Plugins.AddFromType&lt;T&gt;(), which discovered
+        /// methods by their [KernelFunction] attribute. Tools are now an explicit list, so this method
+        /// is the single place that decides which methods the model can call. Adding a method below
+        /// without adding it here leaves it invisible to the model.
+        /// [Description] attributes still drive the schema handed to the model, exactly as before.
+        /// </summary>
+        public IEnumerable<AITool> CreateTools() =>
+        [
+            AIFunctionFactory.Create(GetGenresList),
+            AIFunctionFactory.Create(SearchForPeople),
+            AIFunctionFactory.Create(SearchMovies),
+            AIFunctionFactory.Create(GetMovieTrailers),
+            AIFunctionFactory.Create(GetMovieWithTrailer),
+            AIFunctionFactory.Create(HandleGenericTrailerRequest),
+            AIFunctionFactory.Create(GetMovieDetails),
+            AIFunctionFactory.Create(SearchKeywords),
+            AIFunctionFactory.Create(DescribeMovie),
+            AIFunctionFactory.Create(DiscoverMovies),
+        ];
 
         /// <summary>
         /// The model frequently invents ids like "1990-Joe-Versus-the-Volcano" instead of reusing
@@ -47,7 +68,6 @@ namespace MovieTracker.Backend.Prompts
                .Select(parsed => parsed!.Value)
                .ToList();
 
-        [KernelFunction]
         [Description("Get the list of official genres for movies.")]
         [return: Description("a json list of official genres for movies, with the following properties GenreId and the GenreName")]
         public async Task<string> GetGenresList()
@@ -59,7 +79,6 @@ namespace MovieTracker.Backend.Prompts
         }
 
         public record PersonSearchResult(string PersonId, string PersonName);
-        [KernelFunction]
         [Description("Search for people / cast by their name and also known as names.")]
         [return: Description("a json list of people with the following properties PersonId and the PersonName")]
         public async Task<string> SearchForPeople(
@@ -71,7 +90,6 @@ namespace MovieTracker.Backend.Prompts
             return JsonSerializer.Serialize(personSearchResults);
         }
 
-        [KernelFunction]
         [Description("Search for movies by their title and release year. Use this to find movies, you can search by movie name or part of a movie name")]
         [return: Description("a json list of movies with the following properties MovieId, MovieName, ReleaseDate, and ImdbId")]
         public async Task<string> SearchMovies(
@@ -99,7 +117,6 @@ namespace MovieTracker.Backend.Prompts
             return JsonSerializer.Serialize(movieSearchResults);
         }
 
-        [KernelFunction]
         [Description("Get movie trailers, teasers, video clips, behind-the-scenes content, and interviews for a specific movie. Use this when users ask to 'show trailer', 'play trailer', 'watch video', 'preview movie', 'see teaser', 'video content', 'behind-the-scenes', or any video-related requests for a movie.")]
         [return: Description("JSON object containing all available video content including trailers, teasers, clips, and behind-the-scenes footage")]
         public async Task<string> GetMovieTrailers(
@@ -152,7 +169,6 @@ namespace MovieTracker.Backend.Prompts
             });
         }
 
-        [KernelFunction]
         [Description("Get movie information with trailer included for inline chat display. Use when users ask to 'show movie', 'tell me about movie', or want general movie info that should include a trailer preview.")]
         [return: Description("Complete movie information with embedded trailer for chat display")]
         public async Task<string> GetMovieWithTrailer(
@@ -202,7 +218,6 @@ namespace MovieTracker.Backend.Prompts
             });
         }
 
-        [KernelFunction]
         [Description("Handle generic video/trailer requests when context is unclear. Use for queries like 'trailer please', 'play trailer', 'watch video', 'movie trailer?' when no specific movie is mentioned.")]
         [return: Description("Response asking for clarification about which movie trailer they want")]
         public async Task<string> HandleGenericTrailerRequest(
@@ -222,7 +237,6 @@ namespace MovieTracker.Backend.Prompts
             });
         }
 
-        [KernelFunction]
         [Description("Get detailed information about a specific movie by its ID.")]
         [return: Description("Detailed information about the movie, including title, overview, release date, genres, runtime, and ImdbId.")]
         public async Task<string> GetMovieDetails(
@@ -251,7 +265,6 @@ namespace MovieTracker.Backend.Prompts
             return JsonSerializer.Serialize(movieDetails);
         }
 
-        [KernelFunction]
         [Description("Search for keywords related to movies.")]
         [return: Description("A JSON list of keywords with their properties such as KeywordId and Name.")]
         public async Task<string> SearchKeywords(
@@ -263,7 +276,6 @@ namespace MovieTracker.Backend.Prompts
             return JsonSerializer.Serialize(keywordList);
         }
 
-        [KernelFunction]
         [Description("Returns detailed information about a specific movie in a serialized format")]
         [return: Description("Serialized JSON containing information about a specific movie including ImdbId")]
         public async Task<string> DescribeMovie([Description("The movie ID of a specific movie")] string movieId)
@@ -296,7 +308,6 @@ namespace MovieTracker.Backend.Prompts
             return movieJson;
         }
 
-        [KernelFunction]
         [Description("Discover movies based on various filters and sort options.")]
         [return: Description("A JSON list of movies with their properties such as MovieId, MovieName, ReleaseDate, and ImdbId.")]
         public async Task<string> DiscoverMovies(

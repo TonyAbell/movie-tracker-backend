@@ -2,9 +2,8 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Logging;
-using Microsoft.SemanticKernel.ChatCompletion;
-using Microsoft.SemanticKernel.Connectors.OpenAI;
-using Microsoft.SemanticKernel;
+using Microsoft.Agents.AI;
+using Microsoft.Extensions.AI;
 using OpenTelemetry.Trace;
 using System.Text.Json.Serialization;
 using System.Text.Json;
@@ -13,6 +12,9 @@ using TMDbLib.Client;
 using Microsoft.Extensions.Configuration;
 using MovieTracker.Backend.Prompts;
 using MovieTracker.Backend.Agents;
+// This namespace declares its own ChatMessage - the shape returned to the frontend - which would
+// otherwise shadow the Microsoft.Extensions.AI one used for conversation state.
+using AIChatMessage = Microsoft.Extensions.AI.ChatMessage;
 
 namespace MovieTracker.Backend.Functions
 {
@@ -112,10 +114,10 @@ namespace MovieTracker.Backend.Functions
     public class ChatSession
     {
         public string Id { get; set; }
-        public ChatHistory ChatHistory { get; set; }
+        public List<AIChatMessage> ChatHistory { get; set; }
         public string? FunnyFact { get; set; }  // Funny fact at the session level
 
-        public ChatSession(string id, ChatHistory chatHistory)
+        public ChatSession(string id, List<AIChatMessage> chatHistory)
         {
             Id = id;
             ChatHistory = chatHistory;
@@ -137,9 +139,35 @@ namespace MovieTracker.Backend.Functions
         public string MovieName { get; set; }
     }
 
-    public class Function(Kernel kernel, ChatSessionRepository chatSessionRepository, IDistributedCache cache, IConfiguration configuration, ILogger<Function> logger, Tracer tracer, WikipediaSearchAgent wikipediaAgent, OpenMovieDbAgent openMovieDbAgent, TrailerAgent trailerAgent)
+    public class Function(AIAgent agent, ChatPlanner chatPlanner, ChatSessionRepository chatSessionRepository, IDistributedCache cache, IConfiguration configuration, ILogger<Function> logger, Tracer tracer)
     {
         private readonly string apiKey = configuration["TheMovieDb:Api-Key"] ?? throw new ArgumentNullException("Missing The Movice Db Api Key");
+
+        // The model must answer with MovieListResponse's exact PascalCase property names: the system
+        // prompt names "SystemMessage"/"MovieList" and ProcessMovieAsync reads "MovieId" back out.
+        // Microsoft.Extensions.AI defaults to camelCase, so the naming policy is pinned to null here -
+        // Semantic Kernel's ResponseFormat = typeof(MovieListResponse) used the declared names.
+        private static readonly JsonSerializerOptions StructuredOutputJsonOptions =
+            new(AIJsonUtilities.DefaultOptions) { PropertyNamingPolicy = null };
+
+        // Semantic Kernel's ResponseFormat = typeof(T) emitted a schema in Azure OpenAI's *strict*
+        // dialect. Microsoft.Extensions.AI does not do that by default: ChatResponseFormat.ForJsonSchema
+        // (Type, ...) produces a plain schema with no "required" array and no additionalProperties:false,
+        // which the service rejects with HTTP 400. These two transform flags restore the strict shape.
+        private static readonly ChatResponseFormat MovieListResponseFormat =
+            ChatResponseFormat.ForJsonSchema(
+                AIJsonUtilities.CreateJsonSchema(
+                    typeof(MovieListResponse),
+                    serializerOptions: StructuredOutputJsonOptions,
+                    inferenceOptions: new AIJsonSchemaCreateOptions
+                    {
+                        TransformOptions = new AIJsonSchemaTransformOptions
+                        {
+                            DisallowAdditionalProperties = true,
+                            RequireAllProperties = true,
+                        }
+                    }),
+                nameof(MovieListResponse));
 
         // Reasoning models spend most of their output budget on hidden reasoning tokens, and output
         // tokens are the expensive ones. Measured against this app's own system prompt and tool set,
@@ -200,7 +228,7 @@ namespace MovieTracker.Backend.Functions
                     Always respond only with a JSON object. Keep responses informative but concise (2-4 sentences max).
                     """;
 
-                ChatHistory chatHistory = new(systemMessage);
+                List<AIChatMessage> chatHistory = [new AIChatMessage(ChatRole.System, systemMessage)];
                 var newChatSession = await chatSessionRepository.NewChatSession(chatHistory);
                 return new OkObjectResult(new ChatSessionIdResponse(newChatSession.id));
             }
@@ -351,11 +379,6 @@ namespace MovieTracker.Backend.Functions
                     return new BadRequestObjectResult("Chat not found");
                 }
 
-                var chatPlanner = new ChatPlanner(kernel, wikipediaAgent, openMovieDbAgent, trailerAgent);
-
-                // Add the enhanced context function to kernel
-                kernel.Plugins.Add(KernelPluginFactory.CreateFromObject(chatPlanner));
-
                 //string? funnyFact = await chatPlanner.GenerateFunnyFact(ask.Input);
                 string? funnyFact = await chatPlanner.GenerateEnhancedFunnyFact(ask.Input);
 
@@ -364,41 +387,49 @@ namespace MovieTracker.Backend.Functions
                     chatSession.FunnyFact = funnyFact;
                 }
 
-                chatMessages.AddUserMessage(ask.Input);
-                IChatCompletionService chatCompletionService = kernel.GetRequiredService<IChatCompletionService>();
+                chatMessages.Add(new AIChatMessage(ChatRole.User, ask.Input));
 
-                OpenAIPromptExecutionSettings openAIPromptExecutionSettings = new()
+                // The agent already carries the tool set and invokes tools automatically, so only the
+                // per-call settings are built here. Run options are merged over the agent's defaults,
+                // and tool collections are unioned rather than replaced.
+                ChatOptions chatOptions = new()
                 {
-                    ToolCallBehavior = ToolCallBehavior.AutoInvokeKernelFunctions,
+                    ResponseFormat = MovieListResponseFormat,
                 };
-#pragma warning disable SKEXP0010
-                openAIPromptExecutionSettings.ResponseFormat = typeof(MovieListResponse);
-#pragma warning restore SKEXP0010
+
                 if (!string.IsNullOrWhiteSpace(reasoningEffort)
                     && !string.Equals(reasoningEffort, "default", StringComparison.OrdinalIgnoreCase))
                 {
-                    openAIPromptExecutionSettings.ReasoningEffort = reasoningEffort;
-                }
-
-                var result = await chatCompletionService.GetChatMessageContentsAsync(
-                    chatMessages,
-                    executionSettings: openAIPromptExecutionSettings,
-                    kernel: kernel);
-
-                foreach (var content in result)
-                {
-                    var text = content.ToString();
-                    if (content.Role == AuthorRole.Assistant)
+                    // Deliberately not ChatOptions.Reasoning: its ReasoningEffort enum only offers
+                    // None/Low/Medium/High/ExtraHigh, and this setting has to be able to carry
+                    // model-family-specific values such as "minimal". Dropping to the provider's own
+                    // options type keeps the passthrough behaviour SK had.
+                    // OPENAI001 gates ReasoningEffortLevel as evaluation-only, the same way SKEXP0010
+                    // gated the structured-output ResponseFormat this method used to set.
+#pragma warning disable OPENAI001
+                    chatOptions.RawRepresentationFactory = _ => new OpenAI.Chat.ChatCompletionOptions
                     {
-                        chatMessages.AddAssistantMessage(text);
-                    }
+                        ReasoningEffortLevel = new OpenAI.Chat.ChatReasoningEffortLevel(reasoningEffort)
+                    };
+#pragma warning restore OPENAI001
                 }
+
+                // session: null runs the agent statelessly - the entire conversation is passed in on
+                // every call and the generated messages are appended back onto it. That is exactly what
+                // the Semantic Kernel version did with a ChatHistory, and it is what lets the response
+                // below be rebuilt by re-walking the whole conversation.
+                var result = await agent.RunAsync(chatMessages, null, new ChatClientAgentRunOptions(chatOptions));
+
+                // Includes the intermediate function-call and function-result messages as well as the
+                // final answer. They carry no text, so the loop below skips them, but they must be
+                // persisted: a tool call without its result is an invalid conversation on the next turn.
+                chatMessages.AddRange(result.Messages);
 
                 var responseMessages = new List<ChatMessage>();
                 foreach (var messages in chatMessages)
                 {
-                    var text = messages.ToString();
-                    if (messages.Role == AuthorRole.Assistant && !String.IsNullOrEmpty(text))
+                    var text = messages.Text;
+                    if (messages.Role == ChatRole.Assistant && !String.IsNullOrEmpty(text))
                     {
                         text = text.Replace("```json", "").Replace("```", "");
                         List<MovieViewModel> movieItems = new List<MovieViewModel>();
@@ -433,7 +464,7 @@ namespace MovieTracker.Backend.Functions
                         }
                     }
 
-                    if (messages.Role == AuthorRole.User && !String.IsNullOrEmpty(text))
+                    if (messages.Role == ChatRole.User && !String.IsNullOrEmpty(text))
                     {
                         UserChatMessage userChatMessage = new UserChatMessage(text);
                         responseMessages.Add(userChatMessage);

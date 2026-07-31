@@ -1,6 +1,5 @@
-﻿using Microsoft.Azure.Cosmos;
+using Microsoft.Azure.Cosmos;
 using Microsoft.Extensions.Logging;
-using Microsoft.SemanticKernel.ChatCompletion;
 using OpenTelemetry.Trace;
 using System;
 using System.Collections.Generic;
@@ -9,6 +8,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
+using ChatMessage = Microsoft.Extensions.AI.ChatMessage;
 
 namespace MovieTracker.Backend
 {
@@ -16,7 +16,13 @@ namespace MovieTracker.Backend
     {
         public string id { get; set; }
         public string PartitionKey { get; set; }
-        public ChatHistory ChatHistory { get; set; }
+
+        // Was a Semantic Kernel ChatHistory. The Agent Framework has no equivalent aggregate type -
+        // conversation state is either an opaque AgentSession or, as here, a plain message list that
+        // the caller owns. The property name is kept so the rest of the Cosmos document shape is
+        // unchanged, but the serialized form of the array elements is different, so chat sessions
+        // created before this migration cannot be loaded.
+        public List<ChatMessage> ChatHistory { get; set; }
         public string? FunnyFact { get; set; }
     }
 
@@ -37,7 +43,7 @@ namespace MovieTracker.Backend
             }
         }
 
-        public async Task<MoviceTrackerChatSession> NewChatSession(ChatHistory chatHistory)
+        public async Task<MoviceTrackerChatSession> NewChatSession(List<ChatMessage> chatHistory)
         {
             using var activity = tracer.StartActiveSpan("movie-tracker-func.chat-session-repository.new-chat-session");
             try
@@ -77,7 +83,7 @@ namespace MovieTracker.Backend
             }
         }
 
-        public async Task<MoviceTrackerChatSession> UpdateChatSession(string id, ChatHistory chatHistory)
+        public async Task<MoviceTrackerChatSession> UpdateChatSession(string id, List<ChatMessage> chatHistory)
         {
             using var activity = tracer.StartActiveSpan("movie-tracker-func.chat-session-repository.update-chat-session");
             try
@@ -95,7 +101,7 @@ namespace MovieTracker.Backend
             }
         }
 
-        public async Task<MoviceTrackerChatSession> UpdateChatSession(string id, ChatHistory chatHistory, string? funnyFact)
+        public async Task<MoviceTrackerChatSession> UpdateChatSession(string id, List<ChatMessage> chatHistory, string? funnyFact)
         {
             using var activity = tracer.StartActiveSpan("movie-tracker-func.chat-session-repository.update-chat-session-with-funny-fact");
             try

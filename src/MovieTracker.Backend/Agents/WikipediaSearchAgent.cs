@@ -1,5 +1,4 @@
 ﻿using Microsoft.Extensions.Logging;
-using Microsoft.SemanticKernel;
 using System.ComponentModel;
 using System.Text.Json;
 
@@ -16,7 +15,9 @@ namespace MovieTracker.Backend.Agents
             this.logger = logger;
         }
 
-        [KernelFunction]
+        // Reached through ChatPlanner rather than exposed to the model directly - it was never
+        // registered as a plugin under Semantic Kernel either. The [Description] attributes are kept
+        // so it can be turned into a tool later without rediscovering the wording.
         [Description("Gets enhanced movie/actor information from Wikipedia and Wikidata")]
         [return: Description("Rich information including trivia, context, and detailed facts")]
         public async Task<WikipediaResult?> GetEnhancedInfo(

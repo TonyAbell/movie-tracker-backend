@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A semantic (LLM-driven) chat API over The Movie DB. Users ask natural-language questions ("what action movies in the 90s did the main actor also star in a comedy with Meg Ryan in the 80s?"); Semantic Kernel plans and auto-invokes kernel functions against TMDb/OMDb/Wikipedia to answer. See `Readme.md` for the product framing and example queries.
+A semantic (LLM-driven) chat API over The Movie DB. Users ask natural-language questions ("what action movies in the 90s did the main actor also star in a comedy with Meg Ryan in the 80s?"); **Microsoft Agent Framework** plans and auto-invokes tools against TMDb/OMDb/Wikipedia to answer. See `Readme.md` for the product framing and example queries.
+
+Migrated off Semantic Kernel in July 2026 — see `AGENT_FRAMEWORK_MIGRATION.md` for the reference guide the migration followed, and "Agent Framework wiring" below for what the result looks like. There is no Semantic Kernel left in the project.
 
 Single .NET 10 isolated-worker Azure Functions project: `src/MovieTracker.Backend`. Infrastructure is Bicep in `infrastructure/`. There is no test project.
 
@@ -49,8 +51,10 @@ CI does not build or test — `.github/workflows/pr-function.yml` deploys an eph
 
 Two HTTP functions, both in `Functions/Function.cs`:
 
-- `Chat-Start` (`GET /api/chat/start`) — creates a `ChatHistory` seeded with the **system prompt defined inline in this method**, persists it to Cosmos, returns a short `chatId`. That prompt is the contract for the whole app: it forces the model to reply with a JSON object of `SystemMessage` + `MovieList[{MovieId, MovieName}]`, and to wrap trailer URLs in `[TRAILER]...[/TRAILER]` for the frontend to render inline. Changing response shape means changing this prompt *and* the `MovieListResponse` type used as the structured-output schema.
-- `Chat-Ask` (`POST /api/chat/{chatId}/ask`) — loads the session, runs the planner, calls the LLM with `ToolCallBehavior.AutoInvokeKernelFunctions` and `ResponseFormat = typeof(MovieListResponse)` (SKEXP0010 structured outputs), then **hydrates** the returned `MovieId`s.
+- `Chat-Start` (`GET /api/chat/start`) — creates a `List<ChatMessage>` seeded with the **system prompt defined inline in this method**, persists it to Cosmos, returns a short `chatId`. That prompt is the contract for the whole app: it forces the model to reply with a JSON object of `SystemMessage` + `MovieList[{MovieId, MovieName}]`, and to wrap trailer URLs in `[TRAILER]...[/TRAILER]` for the frontend to render inline. Changing response shape means changing this prompt *and* the `MovieListResponse` type used as the structured-output schema.
+- `Chat-Ask` (`POST /api/chat/{chatId}/ask`) — loads the session, runs the planner, calls `agent.RunAsync(...)` with the `MovieListResponse` structured-output format, then **hydrates** the returned `MovieId`s.
+
+**Structured-output trap.** `MovieListResponseFormat` in `Function.cs` is built with `AIJsonUtilities.CreateJsonSchema` and `AIJsonSchemaTransformOptions { DisallowAdditionalProperties = true, RequireAllProperties = true }`, not with the obvious `ChatResponseFormat.ForJsonSchema(typeof(MovieListResponse), ...)`. The convenient overload emits a schema with no `required` array and no `additionalProperties: false`, which Azure OpenAI's strict structured outputs reject with HTTP 400 — Semantic Kernel's `ResponseFormat = typeof(T)` used to emit the strict dialect for you. The serializer options also pin `PropertyNamingPolicy = null`, because Microsoft.Extensions.AI defaults to camelCase and the system prompt and `ProcessMovieAsync` both depend on PascalCase `SystemMessage`/`MovieList`/`MovieId`.
 
 Hydration is the key two-layer design: the LLM only ever returns TMDb movie IDs; `ProcessMovieAsync` fans out over them, calls TMDbLib for full details plus the best YouTube trailer, and builds the `MovieViewModel` the frontend consumes. Results are cached per `movieId` in `IDistributedCache` (registered as `AddDistributedMemoryCache` — in-process, per-instance, no expiry set).
 
@@ -58,28 +62,45 @@ Note that `Chat-Ask` re-walks and re-hydrates the *entire* chat history on every
 
 Anything the model supplies — movie ids, release years, cast/genre/keyword id lists — is treated as untrusted input. It routinely invents non-numeric ids, so parsing goes through `TryGetTmdbId`/`ParseIdList` in `TheMovieDBKernelFunctions`, which hand the model a correctable error instead of throwing; `SafeProcessMovieAsync` isolates per-movie hydration so one bad entry cannot fail the whole response. A bare `int.Parse` on a model-supplied value is a bug waiting to happen.
 
-The named `"HttpClient"` in `Program.cs` is used **only** by the Kernel (Cosmos takes the unnamed default), and its resilience timeouts are widened well past the 30s default because reasoning models are slow. They stay inside the platform's ~230s hard limit on HTTP triggers.
+The named `"HttpClient"` in `Program.cs` is used **only** by the Azure OpenAI chat client (Cosmos takes the unnamed default), and its resilience timeouts are widened well past the 30s default because reasoning models are slow. They stay inside the platform's ~230s hard limit on HTTP triggers. It reaches the SDK through `AzureOpenAIClientOptions.Transport = new HttpClientPipelineTransport(httpClient)` — if that is dropped, the widened timeouts silently stop applying.
 
-### Semantic Kernel wiring
+### Agent Framework wiring
 
-`Program.cs` registers `Kernel` as **scoped**, backed by **Azure OpenAI in Microsoft Foundry** (`AddAzureOpenAIChatCompletion`) against the `gpt-5-4-mini` deployment in `infrastructure/ai-foundry.bicep`, and adds two plugins at build time:
+`Program.cs` registers two things as **scoped**:
+
+- `IChatClient` — `AzureOpenAIClient(...).GetChatClient(deployment).AsIChatClient()`, against **Azure OpenAI in Microsoft Foundry** (`gpt-5-4-mini`, see `infrastructure/ai-foundry.bicep`), wrapped in `.UseOpenTelemetry(..., EnableSensitiveData = true)`. `GetChatClient` returns the *OpenAI SDK* `ChatClient`, so `AsIChatClient()` is mandatory — omitting it is compile error CS1929.
+- `AIAgent` — `chatClient.AsAIAgent(...)` with the full tool list. `ChatClientAgent` decorates the chat client with automatic function invocation by default, which is what `ToolCallBehavior.AutoInvokeKernelFunctions` used to do.
+
+**The split matters.** `ChatPlanner` and `TrailerAgent` take the bare `IChatClient`, *not* the agent, because their prompts (entity detection, funny facts, trailer-title extraction) must run without the agent's tool set and JSON response format. Under Semantic Kernel they resolved `IChatCompletionService` off the kernel for the same reason.
+
+There is no attribute-driven tool discovery any more. `Plugins.AddFromType<T>()` is replaced by explicit `CreateTools()` methods returning `IEnumerable<AITool>` built with `AIFunctionFactory.Create`, and `Program.cs` unions the three sources. **Adding a `[Description]`-annotated method without adding it to the matching `CreateTools()` leaves it invisible to the model** — this is the single easiest thing to get wrong.
 
 - `Prompts/TheMovieDBKernelFunctions.cs` — the main TMDb surface (genres, person search, movie search, discover with filters, movie details, trailers/videos).
-- `Prompts/DateTimeKernelFunctions.cs` — relative-date helpers so the model can resolve "in the last 10 years" into ISO date ranges rather than hallucinating them.
+- `Prompts/DateTimeKernelFunctions.cs` — relative-date helpers so the model can resolve "in the last 10 years" into ISO date ranges rather than hallucinating them. Static methods.
+- `Prompts/ChatPlanner.cs` — the façade over the `Agents/` classes (ratings, trailers, Wikipedia-backed "funny facts" and context). Now a normal scoped DI service; it used to be constructed by hand in `Chat-Ask` and bolted onto the kernel per request.
 
-`Prompts/ChatPlanner.cs` is added as a plugin **per request** inside `Chat-Ask` (`kernel.Plugins.Add(KernelPluginFactory.CreateFromObject(chatPlanner))`). It is the kernel-facing façade over the `Agents/` classes — ratings, trailers, Wikipedia-backed "funny facts" and context.
+The class names still end in `KernelFunctions` for continuity with the file history; there are no kernels involved.
 
-`Agents/` are plain DI services, not plugins (`WikipediaSearchAgent` carries `[KernelFunction]` attributes but is never registered as a plugin — it's reached through `ChatPlanner`):
+`Agents/` are plain DI services, never exposed to the model directly (`WikipediaSearchAgent` keeps `[Description]` attributes but is reached only through `ChatPlanner`):
 
 - `OpenMovieDbAgent` — OMDb ratings. IMDb rating is intentionally the primary/default rating everywhere; Rotten Tomatoes and Metacritic are secondary context only.
 - `WikipediaSearchAgent` — Wikipedia REST summary + Wikidata SPARQL, with a confidence score gating whether the enriched path or the basic path is used.
 - `TrailerAgent` — keyword-gated (`CanHandle`) flow: extract title via LLM → TMDb search → best official YouTube trailer → `[TRAILER]url[/TRAILER]`.
 
-**To add a new external data source:** add the class under `Agents/`, register it scoped in `Program.cs`, thread it through `ChatPlanner`'s constructor, and add a `[KernelFunction]` wrapper there. `ChatPlanner` is constructed by hand in `Chat-Ask`, so its constructor args must also be added to the `Function` primary constructor.
+**To add a new external data source:** add the class under `Agents/`, register it scoped in `Program.cs`, thread it through `ChatPlanner`'s constructor, add a `[Description]`-annotated wrapper method there, **and add that method to `ChatPlanner.CreateTools()`** — the last step is what actually exposes it to the model.
 
 ### Persistence
 
-`ChatSessionRepository.cs` — Cosmos DB, database `database`, container `chat-sessions`, hardcoded. Document id doubles as the partition key; ids come from `GenId()` (base64 of 5 random bytes, regenerated until URL-safe-clean). The Semantic Kernel `ChatHistory` object is serialized straight into the document via `CosmosSystemTextJsonSerializer`.
+`ChatSessionRepository.cs` — Cosmos DB, database `database`, container `chat-sessions`, hardcoded. Document id doubles as the partition key; ids come from `GenId()` (base64 of 5 random bytes, regenerated until URL-safe-clean). The conversation is a `List<Microsoft.Extensions.AI.ChatMessage>` serialized straight into the document via `CosmosSystemTextJsonSerializer`.
+
+Two constraints on that serializer, both load-bearing:
+
+- Its options come from `AIJsonUtilities.DefaultOptions`, because `ChatMessage.Contents` is a polymorphic `IList<AIContent>`. Plain reflection-based options write the `$type` discriminators but cannot read `FunctionCallContent`/`FunctionResultContent` back, so a session with tool calls fails to load.
+- `PropertyNamingPolicy` is pinned to `null`. `AIJsonUtilities.DefaultOptions` is camelCase, which would rename `PartitionKey` and break every existing document.
+
+The `ChatHistory` *property name* is kept, but its serialized element shape is not the old Semantic Kernel one, so **chat sessions created before the migration cannot be loaded**. New `/api/chat/start` sessions are unaffected; the external HTTP contract did not change.
+
+`Chat-Ask` runs the agent with `session: null`, which is stateless — the whole conversation is passed in on each call and `result.Messages` is appended back. That is deliberately the same shape the Semantic Kernel version had with a `ChatHistory`, and it is what lets the response be rebuilt by re-walking the conversation. The intermediate function-call and function-result messages are persisted too: they carry no text (so the response-building loop skips them), but a tool call without its result is an invalid conversation on the next turn.
 
 ### Configuration
 
@@ -104,7 +125,7 @@ The account lives in **westus**, not the resource group's westus2, which offers 
 
 The Cognitive Services account was upgraded in place from `kind: 'OpenAI'` to `kind: 'AIServices'` with `allowProjectManagement: true` (`infrastructure/ai-foundry.bicep`). The resource name, custom subdomain, `openai.azure.com` endpoint, API keys and existing deployments all survive the upgrade, so no application code changed. It is reversible by setting `kind` back to `OpenAI` after deleting any projects and non-OpenAI deployments.
 
-**Trap:** on an `AIServices` account, `properties.endpoint` returns the generic `https://<name>.cognitiveservices.azure.com/` FQDN, but Semantic Kernel appends `/openai/deployments/<deployment>/chat/completions`, which is served only on `openai.azure.com`. `kv-secrets-openai.bicep` therefore builds the endpoint from `customSubDomainName` instead of reading `properties.endpoint` — reverting that silently breaks every `Chat-Ask` call on the next `main.bicep` deployment.
+**Trap:** on an `AIServices` account, `properties.endpoint` returns the generic `https://<name>.cognitiveservices.azure.com/` FQDN, but `AzureOpenAIClient` appends `/openai/deployments/<deployment>/chat/completions`, which is served only on `openai.azure.com`. `kv-secrets-openai.bicep` therefore builds the endpoint from `customSubDomainName` instead of reading `properties.endpoint` — reverting that silently breaks every `Chat-Ask` call on the next `main.bicep` deployment. (This survived the Agent Framework migration unchanged: the URL is built by the Azure SDK, not by the agent layer.)
 
 Do not set `disableLocalAuth: true` (as the Microsoft upgrade doc's sample does). The function app authenticates with an API key from Key Vault.
 
@@ -126,7 +147,11 @@ Measured head-to-head on this app's own system prompt and tool set (end-to-end, 
 
 The dominant cost was hidden reasoning tokens, not the per-token rate: `gpt-5-mini` spent **1344 of its 1587 completion tokens per turn on reasoning**. `gpt-5.4-mini` emits none at default effort.
 
-`AzureOpenAi:Reasoning-Effort` sets `OpenAIPromptExecutionSettings.ReasoningEffort`. Leave it `default` (or empty) to omit the parameter. Valid values are model-family-specific — `minimal` works on `gpt-5-mini`, `none` is **rejected** on `gpt-5.4-mini` through the API version Semantic Kernel uses, and non-reasoning models such as `grok-4-1-fast-non-reasoning` reject the parameter outright. A wrong value fails every `Chat-Ask` with HTTP 400.
+Those absolute latencies drift between sessions — the same unchanged code measured 29.8s in the morning and 33.3s the same evening. Treat the table as a *relative* comparison, and re-baseline in the same session before concluding anything has regressed.
+
+`AzureOpenAi:Reasoning-Effort` is applied in `Chat-Ask` through `ChatOptions.RawRepresentationFactory`, setting the OpenAI SDK's `ChatCompletionOptions.ReasoningEffortLevel` (gated behind `#pragma warning disable OPENAI001`). Leave it `default` (or empty) to omit the parameter. Valid values are model-family-specific — `minimal` works on `gpt-5-mini`, `none` is **rejected** on `gpt-5.4-mini` through the API version in use, and non-reasoning models such as `grok-4-1-fast-non-reasoning` reject the parameter outright. A wrong value fails every `Chat-Ask` with HTTP 400.
+
+It deliberately does **not** use `ChatOptions.Reasoning`: that takes a `ReasoningEffort` enum limited to `None`/`Low`/`Medium`/`High`/`ExtraHigh`, which cannot express `minimal`. Dropping to the provider options preserves the arbitrary-string passthrough this setting needs.
 
 `dynamicThrottlingEnabled` cannot be set on these deployments — the control plane rejects it for `DataZoneStandard`. Headroom comes from capacity instead. Anthropic models (`claude-haiku-4-5`) additionally require `ModelProviderData` (industry, organization name, country code) that the `az cognitiveservices` CLI does not expose, so deploying one needs the portal or a raw ARM call.
 
@@ -134,4 +159,4 @@ A missing `OpenMovieDb:Api-Key` fails at DI resolution of `OpenMovieDbAgent`, wh
 
 ### Observability
 
-OpenTelemetry traces export to Azure Monitor. Every function and repository method opens a span named `movie-tracker-func.*` via the injected `Tracer`; keep that convention when adding operations. SK sensitive-diagnostics is enabled in `Program.cs`, so prompts and completions appear in traces.
+OpenTelemetry traces export to Azure Monitor. Every function and repository method opens a span named `movie-tracker-func.*` via the injected `Tracer`; keep that convention when adding operations. Model spans come from `.UseOpenTelemetry(loggerFactory, serviceName, o => o.EnableSensitiveData = true)` on the `IChatClient`, which replaced the `Microsoft.SemanticKernel.Experimental.GenAI.EnableOTelDiagnosticsSensitive` AppContext switch — prompts and completions still appear in traces. The activity source is `serviceName` itself, so it is covered by the existing `AddSource(serviceName)`; `Microsoft.Extensions.AI*` and `Microsoft.Agents.AI*` are registered alongside it for the `execute_tool` spans.

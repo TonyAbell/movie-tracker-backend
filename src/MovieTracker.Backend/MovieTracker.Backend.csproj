@@ -11,10 +11,18 @@
 	</PropertyGroup>
 	<ItemGroup>
 		<FrameworkReference Include="Microsoft.AspNetCore.App" />
+		<!-- Supplies AzureOpenAIClient, which Microsoft.Agents.AI.OpenAI does not reference (it targets
+		     the plain OpenAI SDK). The beta line is deliberate and is what Semantic Kernel was already
+		     resolving transitively before the migration: it is the newest published, and it is built
+		     against the same OpenAI 2.10.0 that Microsoft.Extensions.AI.OpenAI requires. The last
+		     stable, 2.1.0, is pinned to OpenAI 2.1.0 and would be silently up-shifted. -->
+		<PackageReference Include="Azure.AI.OpenAI" Version="2.9.0-beta.1" />
 		<PackageReference Include="Azure.Extensions.AspNetCore.Configuration.Secrets" Version="1.5.1" />
 		<PackageReference Include="Azure.Identity" Version="1.21.0" />
 		<PackageReference Include="Azure.Monitor.OpenTelemetry.AspNetCore" Version="1.6.0" />
 		<PackageReference Include="Azure.Monitor.OpenTelemetry.Exporter" Version="1.8.3" />
+		<PackageReference Include="Microsoft.Agents.AI" Version="1.15.0" />
+		<PackageReference Include="Microsoft.Agents.AI.OpenAI" Version="1.15.0" />
 		<!-- Pinned to the 2.x line on purpose. Application Insights 3.x is the OpenTelemetry-based
 		     rewrite and drops ITelemetryInitializer, which Microsoft.Azure.Functions.Worker.ApplicationInsights
 		     still binds to; that package's open-ended PerfCounterCollector [2.23.0, ) range lets 3.x in and
@@ -28,12 +36,10 @@
 		<PackageReference Include="Microsoft.Azure.Functions.Worker.OpenTelemetry" Version="1.2.0" />
 		<PackageReference Include="Microsoft.Azure.Functions.Worker.Sdk" Version="2.1.0" />
 		<PackageReference Include="Microsoft.Azure.Functions.Worker.ApplicationInsights" Version="2.51.0" />
+		<PackageReference Include="Microsoft.Extensions.AI" Version="10.6.0" />
 		<PackageReference Include="Microsoft.Extensions.Caching.Abstractions" Version="10.0.10" />
 		<PackageReference Include="Microsoft.Extensions.Caching.Memory" Version="10.0.10" />
 		<PackageReference Include="Microsoft.Extensions.Http.Resilience" Version="10.8.0" />
-		<PackageReference Include="Microsoft.SemanticKernel" Version="1.78.0" />
-		<PackageReference Include="Microsoft.SemanticKernel.Connectors.AzureOpenAI" Version="1.78.0" />
-		<PackageReference Include="Microsoft.SemanticKernel.Connectors.OpenAI" Version="1.78.0" />
 		<PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
 		<PackageReference Include="OmdbApiNet" Version="1.3.0" />
 		<PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.17.0" />

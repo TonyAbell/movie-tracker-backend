@@ -11,17 +11,19 @@ using Azure.Monitor.OpenTelemetry.AspNetCore;
 using Microsoft.Azure.Cosmos;
 using Azure.Core;
 using Microsoft.Extensions.Logging;
-using Microsoft.SemanticKernel;
+using Microsoft.Agents.AI;
+using Microsoft.Extensions.AI;
 using MovieTracker.Backend;
 using MovieTracker.Backend.Prompts;
 using Azure.Monitor.OpenTelemetry.Exporter;
 using OpenTelemetry.Logs;
 using MovieTracker.Backend.Agents;
+using Azure.AI.OpenAI;
+using System.ClientModel;
+using System.ClientModel.Primitives;
 
 var serviceName = "movie-tracker-backend";
 var serviceVersion = "1.0.0";
-
-AppContext.SetSwitch("Microsoft.SemanticKernel.Experimental.GenAI.EnableOTelDiagnosticsSensitive", true);
 
 var host = new HostBuilder()
     .ConfigureAppConfiguration((context, config) =>
@@ -59,7 +61,7 @@ var host = new HostBuilder()
         services.AddDistributedMemoryCache();
         services.AddApplicationInsightsTelemetryWorkerService();
         services.ConfigureFunctionsApplicationInsights();
-        // This named client is used only by the Semantic Kernel chat completion service.
+        // This named client is used only by the Azure OpenAI chat client behind the agent.
         // The standard resilience handler defaults to a 30s total / 10s per-attempt timeout,
         // which a reasoning model comfortably exceeds, so the budget is widened here.
         // Constraint: SamplingDuration must be >= 2x AttemptTimeout or options validation throws.
@@ -95,11 +97,12 @@ var host = new HostBuilder()
         services.AddScoped<WikipediaSearchAgent>();
         services.AddScoped<OpenMovieDbAgent>();
         services.AddScoped<TrailerAgent>();
-        services.AddScoped<Kernel>(serviceProvider =>
+        // The raw model connection. Registered separately from the agent because the funny-fact and
+        // trailer-title prompts in ChatPlanner/TrailerAgent must run WITHOUT the agent's tool set and
+        // JSON response format - the same reason they resolved IChatCompletionService directly off
+        // the kernel before this migration.
+        services.AddScoped<IChatClient>(serviceProvider =>
         {
-
-
-
             var azureOpenAiEndpoint = context.Configuration["AzureOpenAi:Endpoint"];
             if (string.IsNullOrEmpty(azureOpenAiEndpoint))
             {
@@ -116,43 +119,74 @@ var host = new HostBuilder()
                 throw new ConfigurationErrorsException("Missing AzureOpenAi:Deployment");
             }
 
-            var kernelBuilder = Kernel.CreateBuilder();
             var loggerFactory = serviceProvider.GetRequiredService<ILoggerFactory>();
-            kernelBuilder.Services.AddLogging(builder =>
-            {
-                builder.AddOpenTelemetry(options =>
-                {
-                    options.SetResourceBuilder(ResourceBuilder.CreateDefault());
-                    options.AddAzureMonitorLogExporter(options => options.ConnectionString = context.Configuration["APPLICATIONINSIGHTS-CONNECTION-STRING"]);
-                    options.IncludeFormattedMessage = true;
-                    options.IncludeScopes = true;
-                });
-                builder.AddFilter("Microsoft", LogLevel.Warning);
-                builder.AddFilter("Microsoft.SemanticKernel", LogLevel.Information);
-                builder.SetMinimumLevel(LogLevel.Information);
-            });
-            var configuration = serviceProvider.GetRequiredService<IConfiguration>();
-            kernelBuilder.Services.AddSingleton(configuration);
             IHttpClientFactory httpClientFactory = serviceProvider.GetRequiredService<IHttpClientFactory>();
             var httpClient = httpClientFactory.CreateClient("HttpClient");
-            kernelBuilder.AddAzureOpenAIChatCompletion(
-                deploymentName: azureOpenAiDeployment,
-                endpoint: azureOpenAiEndpoint,
-                apiKey: azureOpenAiApiKey,
-                httpClient: httpClient);
-            kernelBuilder.Plugins.AddFromType<TheMovieDBKernelFunctions>();
-            kernelBuilder.Plugins.AddFromType<DateTimeKernelFunctions>();
 
-            //kernelBuilder.Plugins.AddFromType<ChatPlanner>();
-            var kernel = kernelBuilder.Build();
-            return kernel;
+            // Routing the Azure SDK pipeline through the named HttpClient is what preserves the
+            // widened resilience timeouts configured above; AddAzureOpenAIChatCompletion took the
+            // HttpClient directly.
+            var clientOptions = new AzureOpenAIClientOptions
+            {
+                Transport = new HttpClientPipelineTransport(httpClient)
+            };
+            var azureOpenAiClient = new AzureOpenAIClient(
+                new Uri(azureOpenAiEndpoint),
+                new ApiKeyCredential(azureOpenAiApiKey),
+                clientOptions);
 
+            // GetChatClient returns the OpenAI SDK's ChatClient, not an IChatClient - AsIChatClient
+            // is the required adapter.
+            return azureOpenAiClient
+                .GetChatClient(azureOpenAiDeployment)
+                .AsIChatClient()
+                .AsBuilder()
+                // Replaces the Microsoft.SemanticKernel.Experimental.GenAI.EnableOTelDiagnosticsSensitive
+                // AppContext switch: emits GenAI spans and includes prompts and completions in them.
+                .UseOpenTelemetry(loggerFactory, serviceName, options => options.EnableSensitiveData = true)
+                .Build(serviceProvider);
+        });
+
+        services.AddScoped<TheMovieDBKernelFunctions>();
+        services.AddScoped<ChatPlanner>();
+
+        // The agent replaces the Kernel. Semantic Kernel discovered tools by attribute at build time
+        // (Plugins.AddFromType) and had ChatPlanner bolted on per request; the Agent Framework takes
+        // one explicit tool list, so all three sources are unioned here instead.
+        services.AddScoped<AIAgent>(serviceProvider =>
+        {
+            var chatClient = serviceProvider.GetRequiredService<IChatClient>();
+            var theMovieDbFunctions = serviceProvider.GetRequiredService<TheMovieDBKernelFunctions>();
+            var chatPlanner = serviceProvider.GetRequiredService<ChatPlanner>();
+
+            List<AITool> tools =
+            [
+                .. theMovieDbFunctions.CreateTools(),
+                .. DateTimeKernelFunctions.CreateTools(),
+                .. chatPlanner.CreateTools(),
+            ];
+
+            // ChatClientAgent decorates the chat client with automatic function invocation by default,
+            // which is what ToolCallBehavior.AutoInvokeKernelFunctions used to switch on.
+            return chatClient.AsAIAgent(
+                new ChatClientAgentOptions
+                {
+                    Name = serviceName,
+                    ChatOptions = new ChatOptions { Tools = tools },
+                },
+                serviceProvider.GetRequiredService<ILoggerFactory>(),
+                serviceProvider);
         });
         services.AddOpenTelemetry()
                  .WithTracing((builder) =>
                  {
+                     // serviceName also covers the model spans: it is the source name passed to
+                     // UseOpenTelemetry on the chat client above.
                      builder.AddSource(serviceName)
-                            .AddSource("Microsoft.SemanticKernel*")
+                            .AddSource("Microsoft.Extensions.AI*")
+                            .AddSource("Microsoft.Agents.AI*")
+                            .AddSource("Azure.AI.OpenAI*")
+                            .AddSource("OpenAI*")
                             .SetResourceBuilder(ResourceBuilder.CreateDefault()
                             .AddService(serviceName: serviceName, serviceVersion: serviceVersion))
                             .AddAspNetCoreInstrumentation()

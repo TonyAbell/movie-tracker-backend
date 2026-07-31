@@ -1,27 +1,51 @@
-﻿using Microsoft.SemanticKernel;
-using Microsoft.SemanticKernel.ChatCompletion;
+using Microsoft.Extensions.AI;
 using MovieTracker.Backend.Agents;
 using System.ComponentModel;
 using System.Text.Json;
 
 namespace MovieTracker.Backend.Prompts
 {
+    /// <summary>
+    /// The facade the model sees over the Agents/ services - ratings, trailers and the
+    /// Wikipedia-backed funny facts and context. Under Semantic Kernel this was turned into a plugin
+    /// per request with KernelPluginFactory.CreateFromObject; the Agent Framework equivalent is the
+    /// explicit CreateTools() list below, which Program.cs folds into the agent's tool set.
+    /// </summary>
     public class ChatPlanner
     {
-        private readonly Kernel kernel;
+        // The bare IChatClient, not the AIAgent: these are single-shot prompts that must not inherit
+        // the agent's tool set or its JSON response format. See the note on TrailerAgent.chatClient.
+        private readonly IChatClient chatClient;
         private readonly WikipediaSearchAgent wikipediaAgent;
         private readonly OpenMovieDbAgent openMovieDbAgent;
         private readonly TrailerAgent trailerAgent;
 
-        public ChatPlanner(Kernel kernel, WikipediaSearchAgent wikipediaAgent, OpenMovieDbAgent openMovieDbAgent, TrailerAgent trailerAgent)
+        public ChatPlanner(IChatClient chatClient, WikipediaSearchAgent wikipediaAgent, OpenMovieDbAgent openMovieDbAgent, TrailerAgent trailerAgent)
         {
-            this.kernel = kernel;
+            this.chatClient = chatClient;
             this.wikipediaAgent = wikipediaAgent;
             this.openMovieDbAgent = openMovieDbAgent;
             this.trailerAgent = trailerAgent;
         }
 
-        [KernelFunction]
+        /// <summary>
+        /// Explicit tool list; see the note on TheMovieDBKernelFunctions.CreateTools. This is the same
+        /// set of methods that carried [KernelFunction] before the migration.
+        /// </summary>
+        public IEnumerable<AITool> CreateTools() =>
+        [
+            AIFunctionFactory.Create(HandleTrailerRequest),
+            AIFunctionFactory.Create(GetMovieRating),
+            AIFunctionFactory.Create(CompareMovieRatings),
+            AIFunctionFactory.Create(FilterMoviesByRating),
+            AIFunctionFactory.Create(GetMovieRatingGeneric),
+            AIFunctionFactory.Create(GenerateEnhancedFunnyFact),
+            AIFunctionFactory.Create(GetChatContext),
+            AIFunctionFactory.Create(GenerateFunnyFact),
+            AIFunctionFactory.Create(GenerateRequiredSteps),
+            AIFunctionFactory.Create(GetMovieContext),
+        ];
+
         [Description("Handle trailer requests and return clickable trailer links")]
         public async Task<string> HandleTrailerRequest(string userQuery)
         {
@@ -33,7 +57,6 @@ namespace MovieTracker.Backend.Prompts
             return await GenerateRequiredSteps();
         }
 
-        [KernelFunction]
         [Description("Get movie rating (defaults to IMDb rating) for a specific movie using its IMDb ID. Always returns IMDb rating as the primary rating.")]
         [return: Description("JSON object containing IMDb rating as the primary rating, with other ratings as additional context")]
         public async Task<string> GetMovieRating(
@@ -58,7 +81,6 @@ namespace MovieTracker.Backend.Prompts
             });
         }
 
-        [KernelFunction]
         [Description("Compare IMDb ratings of multiple movies and find the highest rated one. Always uses IMDb ratings for comparison.")]
         [return: Description("Comparison results showing which movie has the highest IMDb rating")]
         public async Task<string> CompareMovieRatings(
@@ -87,7 +109,6 @@ namespace MovieTracker.Backend.Prompts
             });
         }
 
-        [KernelFunction]
         [Description("Filter movies by IMDb rating threshold. Always uses IMDb ratings for filtering.")]
         [return: Description("List of movies that meet the minimum IMDb rating requirement")]
         public async Task<string> FilterMoviesByRating(
@@ -114,7 +135,6 @@ namespace MovieTracker.Backend.Prompts
             });
         }
 
-        [KernelFunction]
         [Description("Get rating for a movie (uses IMDb rating as default). Use this when user asks about 'rating' without specifying the source.")]
         [return: Description("Movie rating information with IMDb rating as the primary rating")]
         public async Task<string> GetMovieRatingGeneric(
@@ -144,7 +164,6 @@ namespace MovieTracker.Backend.Prompts
             });
         }
 
-        [KernelFunction]
         [Description("Enhanced funny fact generator using Wikipedia data")]
         public async Task<string?> GenerateEnhancedFunnyFact(string userQuery)
         {
@@ -163,16 +182,13 @@ namespace MovieTracker.Backend.Prompts
                 Generate ONE surprising, entertaining fact that most people wouldn't know.
                 Keep it under 100 characters and make it engaging for movie fans.
                 ";
-
-                var chatService = kernel.GetRequiredService<IChatCompletionService>();
-                var result = await chatService.GetChatMessageContentAsync(enhancedPrompt);
-                return result.Content?.Trim();
+                var result = await chatClient.GetResponseAsync(enhancedPrompt);
+                return result.Text?.Trim();
             }
 
             return await GenerateBasicFunnyFact(detectedEntity);
         }
 
-        [KernelFunction]
         [Description("Gets detailed information about movies/actors for chat context")]
         public async Task<string?> GetChatContext(string entityName, string entityType = "movie")
         {
@@ -189,7 +205,6 @@ namespace MovieTracker.Backend.Prompts
             });
         }
 
-        [KernelFunction]
         [Description("Detects if user query mentions specific actors/movies and generates a funny fact")]
         [return: Description("A funny fact if entities are detected, null otherwise")]
         public async Task<string?> GenerateFunnyFact(string userQuery)
@@ -211,10 +226,8 @@ namespace MovieTracker.Backend.Prompts
             Query: 'what popular movies came out last year' -> 'NONE'
             Query: 'movies directed by Christopher Nolan' -> 'Christopher Nolan'
             ";
-
-            var chatService = kernel.GetRequiredService<IChatCompletionService>();
-            var detectionResult = await chatService.GetChatMessageContentAsync(entityDetectionPrompt);
-            var detectedEntity = detectionResult.Content?.Trim() ?? "NONE";
+            var detectionResult = await chatClient.GetResponseAsync(entityDetectionPrompt);
+            var detectedEntity = detectionResult.Text?.Trim() ?? "NONE";
 
             if (detectedEntity.ToUpper() == "NONE")
             {
@@ -232,11 +245,10 @@ namespace MovieTracker.Backend.Prompts
             - Christopher Nolan doesn't use email or a smartphone.
             ";
 
-            var funnyFactResult = await chatService.GetChatMessageContentAsync(funnyFactPrompt);
-            return funnyFactResult.Content?.Trim();
+            var funnyFactResult = await chatClient.GetResponseAsync(funnyFactPrompt);
+            return funnyFactResult.Text?.Trim();
         }
 
-        [KernelFunction]
         [Description("Returns instructions on how best to respond to the user")]
         [return: Description("The list of steps to best respond to the user")]
         public async Task<string> GenerateRequiredSteps()
@@ -281,10 +293,8 @@ namespace MovieTracker.Backend.Prompts
         Query: 'what popular movies came out last year' -> 'NONE'
         Query: 'movies directed by Christopher Nolan' -> 'Christopher Nolan'
         ";
-
-            var chatService = kernel.GetRequiredService<IChatCompletionService>();
-            var detectionResult = await chatService.GetChatMessageContentAsync(entityDetectionPrompt);
-            return detectionResult.Content?.Trim() ?? "NONE";
+            var detectionResult = await chatClient.GetResponseAsync(entityDetectionPrompt);
+            return detectionResult.Text?.Trim() ?? "NONE";
         }
 
         private async Task<string?> GenerateBasicFunnyFact(string detectedEntity)
@@ -299,13 +309,10 @@ namespace MovieTracker.Backend.Prompts
         - The Matrix's famous green code is actually sushi recipes in Japanese.
         - Christopher Nolan doesn't use email or a smartphone.
         ";
-
-            var chatService = kernel.GetRequiredService<IChatCompletionService>();
-            var funnyFactResult = await chatService.GetChatMessageContentAsync(funnyFactPrompt);
-            return funnyFactResult.Content?.Trim();
+            var funnyFactResult = await chatClient.GetResponseAsync(funnyFactPrompt);
+            return funnyFactResult.Text?.Trim();
         }
 
-        [KernelFunction]
         [Description("Provides rich context about movies/actors for enhanced responses")]
         public async Task<string?> GetMovieContext(string userQuery)
         {
@@ -326,10 +333,8 @@ namespace MovieTracker.Backend.Prompts
             Focus on surprising details, cultural impact, or behind-the-scenes stories.
             Keep it concise but engaging.
             ";
-
-                var chatService = kernel.GetRequiredService<IChatCompletionService>();
-                var result = await chatService.GetChatMessageContentAsync(contextPrompt);
-                return result.Content?.Trim();
+                var result = await chatClient.GetResponseAsync(contextPrompt);
+                return result.Text?.Trim();
             }
 
             return null;

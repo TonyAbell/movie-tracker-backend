@@ -1,6 +1,5 @@
-﻿using Microsoft.Extensions.Configuration;
-using Microsoft.SemanticKernel;
-using Microsoft.SemanticKernel.ChatCompletion;
+﻿using Microsoft.Extensions.AI;
+using Microsoft.Extensions.Configuration;
 using System.Text.Json;
 using TMDbLib.Client;
 
@@ -9,16 +8,21 @@ namespace MovieTracker.Backend.Agents
     public class TrailerAgent
     {
         private readonly string apiKey;
-        private readonly IChatCompletionService chatService;
+
+        // The bare IChatClient, deliberately not the AIAgent: this is a single-shot extraction prompt
+        // that must not inherit the agent's tool set or its JSON response format. Under Semantic
+        // Kernel this was kernel.GetRequiredService<IChatCompletionService>() called with no
+        // execution settings, which had the same effect.
+        private readonly IChatClient chatClient;
 
         private static readonly string[] TrailerKeywords = {
             "trailer", "preview", "teaser", "video", "watch", "play", "show", "promo", "attraction video"
         };
 
-        public TrailerAgent(IConfiguration configuration, Kernel kernel)
+        public TrailerAgent(IConfiguration configuration, IChatClient chatClient)
         {
             this.apiKey = configuration["TheMovieDb:Api-Key"] ?? throw new ArgumentNullException("Missing The Movie Db Api Key");
-            this.chatService = kernel.GetRequiredService<IChatCompletionService>();
+            this.chatClient = chatClient;
         }
 
         public bool CanHandle(string userQuery)
@@ -55,8 +59,8 @@ namespace MovieTracker.Backend.Agents
                 'trailer please' -> 'UNKNOWN'
                 ";
 
-            var result = await chatService.GetChatMessageContentAsync(prompt);
-            var movieTitle = result.Content?.Trim();
+            var result = await chatClient.GetResponseAsync(prompt);
+            var movieTitle = result.Text?.Trim();
 
             return movieTitle?.ToUpper() == "UNKNOWN" ? "" : movieTitle ?? "";
         }

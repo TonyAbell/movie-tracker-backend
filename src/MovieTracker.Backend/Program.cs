@@ -25,6 +25,12 @@ using System.ClientModel.Primitives;
 var serviceName = "movie-tracker-backend";
 var serviceVersion = "1.0.0";
 
+// FunctionInvokingChatClient allows 40 tool-calling iterations per request by default. At a few
+// seconds per round trip that exhausts the 120s HttpClient budget, and then the platform's ~230s
+// trigger limit, long before it gives up - the caller sees a timeout rather than an answer. A real
+// query needs far fewer: resolve a person, discover, fetch details, sometimes ratings.
+const int MaxToolIterations = 12;
+
 var host = new HostBuilder()
     .ConfigureAppConfiguration((context, config) =>
     {
@@ -73,7 +79,12 @@ var host = new HostBuilder()
                     options.TotalRequestTimeout.Timeout = TimeSpan.FromSeconds(120);
                     options.AttemptTimeout.Timeout = TimeSpan.FromSeconds(60);
                     options.CircuitBreaker.SamplingDuration = TimeSpan.FromSeconds(120);
-                    options.Retry.MaxRetryAttempts = 1;
+                    // The deployment is DataZoneStandard at 200K TPM and Chat-Ask now issues the
+                    // funny-fact completion and the main agent call at the same time, so bursts are
+                    // sharper than they were when the two ran back to back. The default handler already
+                    // treats 429 as transient and honours Retry-After; only the attempt budget needed
+                    // widening. TotalRequestTimeout still caps how long the retries can run.
+                    options.Retry.MaxRetryAttempts = 3;
                 });
 
         services.AddSingleton(TracerProvider.Default.GetTracer(serviceName, serviceVersion));
@@ -166,9 +177,11 @@ var host = new HostBuilder()
                 .. chatPlanner.CreateTools(),
             ];
 
+            var agentLogger = serviceProvider.GetRequiredService<ILogger<Program>>();
+
             // ChatClientAgent decorates the chat client with automatic function invocation by default,
             // which is what ToolCallBehavior.AutoInvokeKernelFunctions used to switch on.
-            return chatClient.AsAIAgent(
+            var agent = chatClient.AsAIAgent(
                 new ChatClientAgentOptions
                 {
                     Name = serviceName,
@@ -176,6 +189,32 @@ var host = new HostBuilder()
                 },
                 serviceProvider.GetRequiredService<ILoggerFactory>(),
                 serviceProvider);
+
+            // Function-invocation middleware. Wraps each individual tool call, so Iteration is the
+            // model's round-trip count within this request; Terminate ends the loop and returns what
+            // the model has produced so far, which Chat-Ask degrades gracefully on. AsBuilder().Build()
+            // returns a NEW agent - the result has to be what gets registered, or none of this runs.
+            return agent
+                .AsBuilder()
+                .Use(async (
+                    AIAgent invokedAgent,
+                    FunctionInvocationContext context,
+                    Func<FunctionInvocationContext, CancellationToken, ValueTask<object?>> next,
+                    CancellationToken cancellationToken) =>
+                {
+                    if (context.Iteration >= MaxToolIterations)
+                    {
+                        agentLogger.LogWarning(
+                            "Tool-call budget of {MaxToolIterations} iterations exhausted at {FunctionName}; ending the turn",
+                            MaxToolIterations, context.Function.Name);
+
+                        context.Terminate = true;
+                        return $"Tool-call budget exhausted. Answer with the information already gathered.";
+                    }
+
+                    return await next(context, cancellationToken);
+                })
+                .Build(serviceProvider);
         });
         services.AddOpenTelemetry()
                  .WithTracing((builder) =>

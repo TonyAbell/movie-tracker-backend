@@ -294,7 +294,10 @@ namespace MovieTracker.Backend.Prompts
                 Genres = movie.Genres.Select(g => g.Name).ToList(),
                 Runtime = movie.Runtime,
                 Tagline = movie.Tagline,
-                Rating = movie.VoteAverage,
+                // Named for what it is. Called "Rating" this reads as *the* rating, and the model
+                // would answer "which had the highest rating?" straight from it instead of calling
+                // GetMovieRating - which is the IMDb-backed answer this app treats as the default.
+                TmdbVoteAverage = movie.VoteAverage,
                 Language = movie.OriginalLanguage,
                 ImdbId = movie.ImdbId ?? "",
                 Cast = (await client.GetMovieCreditsAsync(movie.Id))?.Cast.Take(5).Select(c => c.Name).ToList() // Top 5 cast members

@@ -1,6 +1,6 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 	<PropertyGroup>
-		<TargetFramework>net8.0</TargetFramework>
+		<TargetFramework>net10.0</TargetFramework>
 		<AzureFunctionsVersion>v4</AzureFunctionsVersion>
 		<OutputType>Exe</OutputType>
 		<ImplicitUsings>enable</ImplicitUsings>
@@ -11,29 +11,33 @@
 	</PropertyGroup>
 	<ItemGroup>
 		<FrameworkReference Include="Microsoft.AspNetCore.App" />
-		<PackageReference Include="Azure.Extensions.AspNetCore.Configuration.Secrets" Version="1.4.0" />
-		<PackageReference Include="Azure.Identity" Version="1.13.2" />
-		<PackageReference Include="Azure.Monitor.OpenTelemetry.AspNetCore" Version="1.3.0" />
-		<PackageReference Include="Azure.Monitor.OpenTelemetry.Exporter" Version="1.4.0" />
+		<PackageReference Include="Azure.Extensions.AspNetCore.Configuration.Secrets" Version="1.5.1" />
+		<PackageReference Include="Azure.Identity" Version="1.21.0" />
+		<PackageReference Include="Azure.Monitor.OpenTelemetry.AspNetCore" Version="1.6.0" />
+		<PackageReference Include="Azure.Monitor.OpenTelemetry.Exporter" Version="1.8.3" />
+		<!-- Pinned to the 2.x line on purpose. Application Insights 3.x is the OpenTelemetry-based
+		     rewrite and drops ITelemetryInitializer, which Microsoft.Azure.Functions.Worker.ApplicationInsights
+		     still binds to; that package's open-ended PerfCounterCollector [2.23.0, ) range lets 3.x in and
+		     the worker then dies at startup with TypeLoadException. Do not bump until the worker package
+		     declares support for Application Insights 3.x. -->
 		<PackageReference Include="Microsoft.ApplicationInsights.WorkerService" Version="2.23.0" />
-		<PackageReference Include="Microsoft.Azure.Cosmos" Version="3.50.0" />
-		<PackageReference Include="Microsoft.Azure.Functions.Worker" Version="2.0.0" />
+		<PackageReference Include="Microsoft.Azure.Cosmos" Version="3.62.0" />
+		<PackageReference Include="Microsoft.Azure.Functions.Worker" Version="2.52.0" />
 		<PackageReference Include="Microsoft.Azure.Functions.Worker.Extensions.Http" Version="3.3.0" />
-		<PackageReference Include="Microsoft.Azure.Functions.Worker.Extensions.Http.AspNetCore" Version="2.0.1" />
-		<PackageReference Include="Microsoft.Azure.Functions.Worker.OpenTelemetry" Version="1.0.0-preview1" />
-		<PackageReference Include="Microsoft.Azure.Functions.Worker.Sdk" Version="2.0.2" />
-		<PackageReference Include="Microsoft.Azure.Functions.Worker.ApplicationInsights" Version="2.0.0" />
-		<PackageReference Include="Microsoft.Extensions.Caching.Abstractions" Version="9.0.4" />
-		<PackageReference Include="Microsoft.Extensions.Caching.Memory" Version="9.0.4" />
-		<PackageReference Include="Microsoft.Extensions.Http.Resilience" Version="9.4.0" />
-		<PackageReference Include="Microsoft.KernelMemory.AI.OpenAI" Version="0.98.250508.3" />
-		<PackageReference Include="Microsoft.SemanticKernel" Version="1.49.0" />
-		<PackageReference Include="Microsoft.SemanticKernel.Connectors.AzureOpenAI" Version="1.49.0" />
-		<PackageReference Include="Microsoft.SemanticKernel.Connectors.OpenAI" Version="1.49.0" />
-		<PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+		<PackageReference Include="Microsoft.Azure.Functions.Worker.Extensions.Http.AspNetCore" Version="2.1.1" />
+		<PackageReference Include="Microsoft.Azure.Functions.Worker.OpenTelemetry" Version="1.2.0" />
+		<PackageReference Include="Microsoft.Azure.Functions.Worker.Sdk" Version="2.1.0" />
+		<PackageReference Include="Microsoft.Azure.Functions.Worker.ApplicationInsights" Version="2.51.0" />
+		<PackageReference Include="Microsoft.Extensions.Caching.Abstractions" Version="10.0.10" />
+		<PackageReference Include="Microsoft.Extensions.Caching.Memory" Version="10.0.10" />
+		<PackageReference Include="Microsoft.Extensions.Http.Resilience" Version="10.8.0" />
+		<PackageReference Include="Microsoft.SemanticKernel" Version="1.78.0" />
+		<PackageReference Include="Microsoft.SemanticKernel.Connectors.AzureOpenAI" Version="1.78.0" />
+		<PackageReference Include="Microsoft.SemanticKernel.Connectors.OpenAI" Version="1.78.0" />
+		<PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
 		<PackageReference Include="OmdbApiNet" Version="1.3.0" />
-		<PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.12.0" />
-		<PackageReference Include="TMDbLib" Version="2.2.0" />
+		<PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.17.0" />
+		<PackageReference Include="TMDbLib" Version="3.0.0" />
 	</ItemGroup>
 	<ItemGroup>
 		<None Update="host.json">

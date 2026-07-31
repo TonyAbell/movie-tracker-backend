@@ -38,7 +38,7 @@ resource functionApp 'Microsoft.Web/sites@2021-01-01' = {
     serverFarmId: appServicePlan.id
     siteConfig: {
       use32BitWorkerProcess: false
-      netFrameworkVersion: 'v9.0'
+      netFrameworkVersion: 'v10.0'
       appSettings: [
         {
           name: 'FUNCTIONS_EXTENSION_VERSION'

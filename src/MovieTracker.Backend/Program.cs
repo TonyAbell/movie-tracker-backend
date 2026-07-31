@@ -12,7 +12,6 @@ using Microsoft.Azure.Cosmos;
 using Azure.Core;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
-using Microsoft.KernelMemory;
 using MovieTracker.Backend;
 using MovieTracker.Backend.Prompts;
 using Azure.Monitor.OpenTelemetry.Exporter;

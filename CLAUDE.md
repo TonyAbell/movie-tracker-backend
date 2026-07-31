@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A semantic (LLM-driven) chat API over The Movie DB. Users ask natural-language questions ("what action movies in the 90s did the main actor also star in a comedy with Meg Ryan in the 80s?"); Semantic Kernel plans and auto-invokes kernel functions against TMDb/OMDb/Wikipedia to answer. See `Readme.md` for the product framing and example queries.
 
-Single .NET 8 isolated-worker Azure Functions project: `src/MovieTracker.Backend`. Infrastructure is Bicep in `infrastructure/`. There is no test project.
+Single .NET 10 isolated-worker Azure Functions project: `src/MovieTracker.Backend`. Infrastructure is Bicep in `infrastructure/`. There is no test project.
 
 ## Commands
 
@@ -39,7 +39,9 @@ az deployment group create --resource-group <rg> --template-file infrastructure/
   --parameters adminPrincipalIds="['<objectId>']" open_ai_api_key='<key>' the_movie_db_api_key='<key>'
 ```
 
-CI does not build or test — `.github/workflows/pr-function.yml` deploys an ephemeral function app per PR (`infrastructure/func-pr.bicep`) and deletes it on close; `deploy-main.yml` publishes to the existing prod function app when a PR merges to `main`. Both install the .NET 9 SDK even though the project targets `net8.0`.
+CI does not build or test — `.github/workflows/pr-function.yml` deploys an ephemeral function app per PR (`infrastructure/func-pr.bicep`) and deletes it on close; `deploy-main.yml` publishes to the existing prod function app when a PR merges to `main`. Both install the .NET 10 SDK, matching the project's `net10.0` target and the function apps' `netFrameworkVersion: v10.0`.
+
+`Microsoft.ApplicationInsights.WorkerService` is deliberately held at the 2.x line. Application Insights 3.x is the OpenTelemetry-based rewrite and removes `ITelemetryInitializer`, which `Microsoft.Azure.Functions.Worker.ApplicationInsights` still binds to — and that package's open-ended `PerfCounterCollector [2.23.0, )` range will happily pull 3.x in. The result is a worker that builds fine and then dies at startup with `TypeLoadException` (surfacing as exit code `0xE0434352`). A clean build does not prove this app boots; run `func start` before publishing.
 
 ## Architecture
 

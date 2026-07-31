@@ -60,8 +60,20 @@ var host = new HostBuilder()
         services.AddDistributedMemoryCache();
         services.AddApplicationInsightsTelemetryWorkerService();
         services.ConfigureFunctionsApplicationInsights();
+        // This named client is used only by the Semantic Kernel chat completion service.
+        // The standard resilience handler defaults to a 30s total / 10s per-attempt timeout,
+        // which a reasoning model comfortably exceeds, so the budget is widened here.
+        // Constraint: SamplingDuration must be >= 2x AttemptTimeout or options validation throws.
         services.AddHttpClient("HttpClient")
-                .AddStandardResilienceHandler();
+                .AddStandardResilienceHandler(options =>
+                {
+                    // A single /ask makes several LLM round trips and the platform kills HTTP
+                    // triggers at ~230s, so per-call budgets stay well inside that ceiling.
+                    options.TotalRequestTimeout.Timeout = TimeSpan.FromSeconds(120);
+                    options.AttemptTimeout.Timeout = TimeSpan.FromSeconds(60);
+                    options.CircuitBreaker.SamplingDuration = TimeSpan.FromSeconds(120);
+                    options.Retry.MaxRetryAttempts = 1;
+                });
 
         services.AddSingleton(TracerProvider.Default.GetTracer(serviceName, serviceVersion));
         services.AddSingleton<CosmosClient>(serviceProvider =>
@@ -89,17 +101,21 @@ var host = new HostBuilder()
 
 
 
-            var apiKey = context.Configuration["OpenAi:Api-Key"];
-            if (string.IsNullOrEmpty(apiKey))
+            var azureOpenAiEndpoint = context.Configuration["AzureOpenAi:Endpoint"];
+            if (string.IsNullOrEmpty(azureOpenAiEndpoint))
             {
-                throw new Exception("OpenAIKey is missing from configuration");
+                throw new ConfigurationErrorsException("Missing AzureOpenAi:Endpoint");
             }
-            OpenAIConfig openAIOptions = new()
+            var azureOpenAiApiKey = context.Configuration["AzureOpenAi:Api-Key"];
+            if (string.IsNullOrEmpty(azureOpenAiApiKey))
             {
-                TextGenerationType = OpenAIConfig.TextGenerationTypes.Chat,
-                TextModel = "gpt-4o",
-                APIKey = apiKey
-            };
+                throw new ConfigurationErrorsException("Missing AzureOpenAi:Api-Key");
+            }
+            var azureOpenAiDeployment = context.Configuration["AzureOpenAi:Deployment"];
+            if (string.IsNullOrEmpty(azureOpenAiDeployment))
+            {
+                throw new ConfigurationErrorsException("Missing AzureOpenAi:Deployment");
+            }
 
             var kernelBuilder = Kernel.CreateBuilder();
             var loggerFactory = serviceProvider.GetRequiredService<ILoggerFactory>();
@@ -120,7 +136,11 @@ var host = new HostBuilder()
             kernelBuilder.Services.AddSingleton(configuration);
             IHttpClientFactory httpClientFactory = serviceProvider.GetRequiredService<IHttpClientFactory>();
             var httpClient = httpClientFactory.CreateClient("HttpClient");
-            kernelBuilder.AddOpenAIChatCompletion(openAIOptions.TextModel, openAIOptions.APIKey, httpClient: httpClient);
+            kernelBuilder.AddAzureOpenAIChatCompletion(
+                deploymentName: azureOpenAiDeployment,
+                endpoint: azureOpenAiEndpoint,
+                apiKey: azureOpenAiApiKey,
+                httpClient: httpClient);
             kernelBuilder.Plugins.AddFromType<TheMovieDBKernelFunctions>();
             kernelBuilder.Plugins.AddFromType<DateTimeKernelFunctions>();
 

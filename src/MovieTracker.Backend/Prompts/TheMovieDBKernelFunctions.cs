@@ -15,6 +15,38 @@ namespace MovieTracker.Backend.Prompts
         private readonly string apiKey = configuration["TheMovieDb:Api-Key"] ?? throw new ArgumentNullException("Missing The Movice Db Api Key");
         private record MovieItem(string MovieId, string MovieName);
 
+        /// <summary>
+        /// The model frequently invents ids like "1990-Joe-Versus-the-Volcano" instead of reusing
+        /// one returned by a search. Throwing on those aborts the whole chat turn, so instead hand
+        /// the model a description of what it did wrong and let it correct itself.
+        /// </summary>
+        private static bool TryGetTmdbId(string? movieId, out int id, out string error)
+        {
+            if (int.TryParse(movieId, out id))
+            {
+                error = string.Empty;
+                return true;
+            }
+
+            error = JsonSerializer.Serialize(new
+            {
+                Error = $"'{movieId}' is not a valid TMDb movie id. Ids are numeric, e.g. '13'.",
+                Hint = "Call SearchMovies or DiscoverMovies first and use the MovieId it returns."
+            });
+            return false;
+        }
+
+        /// <summary>
+        /// Parses a model-supplied comma separated id list, dropping anything non-numeric
+        /// (the model sometimes passes names rather than ids).
+        /// </summary>
+        private static List<int> ParseIdList(string ids) =>
+            ids.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+               .Select(value => int.TryParse(value, out var parsed) ? parsed : (int?)null)
+               .Where(parsed => parsed.HasValue)
+               .Select(parsed => parsed!.Value)
+               .ToList();
+
         [KernelFunction]
         [Description("Get the list of official genres for movies.")]
         [return: Description("a json list of official genres for movies, with the following properties GenreId and the GenreName")]
@@ -47,7 +79,8 @@ namespace MovieTracker.Backend.Prompts
             [Description("Optional: The year the movie was released")] string? releaseYear = null)
         {
             TMDbClient client = new TMDbClient(apiKey);
-            var yearAsInt = int.Parse(releaseYear ?? "0");
+            // The model sometimes passes values like "1990s" or "mid-90s"; treat those as unset.
+            _ = int.TryParse(releaseYear, out var yearAsInt);
             var searchResults = await client.SearchMovieAsync(movieTitle, year: yearAsInt);
 
             var movieSearchResults = new List<MovieSearchResult>();
@@ -72,8 +105,10 @@ namespace MovieTracker.Backend.Prompts
         public async Task<string> GetMovieTrailers(
         [Description("The TMDb movie ID")] string movieId)
         {
+            if (!TryGetTmdbId(movieId, out var tmdbId, out var idError)) return idError;
+
             TMDbClient client = new TMDbClient(apiKey);
-            var videos = await client.GetMovieVideosAsync(int.Parse(movieId));
+            var videos = await client.GetMovieVideosAsync(tmdbId);
 
             var allVideos = videos.Results
                 .Where(v => v.Site == "YouTube")
@@ -95,7 +130,7 @@ namespace MovieTracker.Backend.Prompts
             var behindScenes = allVideos.Where(v => v.Type == "Behind the Scenes").ToList();
             var featurettes = allVideos.Where(v => v.Type == "Featurette").ToList();
 
-            var movie = await client.GetMovieAsync(int.Parse(movieId));
+            var movie = await client.GetMovieAsync(tmdbId);
 
             return JsonSerializer.Serialize(new
             {
@@ -123,9 +158,11 @@ namespace MovieTracker.Backend.Prompts
         public async Task<string> GetMovieWithTrailer(
             [Description("The TMDb movie ID")] string movieId)
         {
+            if (!TryGetTmdbId(movieId, out var tmdbId, out var idError)) return idError;
+
             TMDbClient client = new TMDbClient(apiKey);
-            var movie = await client.GetMovieAsync(int.Parse(movieId));
-            var videos = await client.GetMovieVideosAsync(int.Parse(movieId));
+            var movie = await client.GetMovieAsync(tmdbId);
+            var videos = await client.GetMovieVideosAsync(tmdbId);
 
             var trailer = videos.Results
                 .Where(v => v.Type == "Trailer" && v.Site == "YouTube")
@@ -191,8 +228,10 @@ namespace MovieTracker.Backend.Prompts
         public async Task<string> GetMovieDetails(
         [Description("The ID of the movie")] string movieId)
         {
+            if (!TryGetTmdbId(movieId, out var tmdbId, out var idError)) return idError;
+
             TMDbClient client = new TMDbClient(apiKey);
-            var movie = await client.GetMovieAsync(int.Parse(movieId));
+            var movie = await client.GetMovieAsync(tmdbId);
 
             var movieDetails = new
             {
@@ -229,8 +268,10 @@ namespace MovieTracker.Backend.Prompts
         [return: Description("Serialized JSON containing information about a specific movie including ImdbId")]
         public async Task<string> DescribeMovie([Description("The movie ID of a specific movie")] string movieId)
         {
+            if (!TryGetTmdbId(movieId, out var tmdbId, out var idError)) return idError;
+
             TMDbClient client = new TMDbClient(apiKey);
-            var movie = await client.GetMovieAsync(int.Parse(movieId));
+            var movie = await client.GetMovieAsync(tmdbId);
 
             var movieData = new
             {
@@ -290,22 +331,31 @@ namespace MovieTracker.Backend.Prompts
             // Apply cast filters
             if (!string.IsNullOrEmpty(castIds))
             {
-                var castIdList = castIds.Split(',').Select(int.Parse);
-                query = query.IncludeWithAllOfCast(castIdList);
+                var castIdList = ParseIdList(castIds);
+                if (castIdList.Count > 0)
+                {
+                    query = query.IncludeWithAllOfCast(castIdList);
+                }
             }
 
             // Apply genre filters
             if (!string.IsNullOrEmpty(genreIds))
             {
-                var genreIdList = genreIds.Split(',').Select(int.Parse);
-                query = query.IncludeWithAllOfGenre(genreIdList);
+                var genreIdList = ParseIdList(genreIds);
+                if (genreIdList.Count > 0)
+                {
+                    query = query.IncludeWithAllOfGenre(genreIdList);
+                }
             }
 
             // Apply keyword filters
             if (!string.IsNullOrEmpty(keywordIds))
             {
-                var keywordIdList = keywordIds.Split(',').Select(int.Parse);
-                query = query.IncludeWithAllOfKeywords(keywordIdList);
+                var keywordIdList = ParseIdList(keywordIds);
+                if (keywordIdList.Count > 0)
+                {
+                    query = query.IncludeWithAllOfKeywords(keywordIdList);
+                }
             }
 
             // Apply vote average filters

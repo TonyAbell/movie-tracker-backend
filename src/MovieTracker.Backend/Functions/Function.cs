@@ -157,6 +157,17 @@ namespace MovieTracker.Backend.Functions
                     - Fun connections between actors, directors, and other films
                     - Engaging descriptions that make movies sound exciting
 
+                    **Looking up movies - this is required, not optional:**
+                    - You have functions for searching The Movie DB. Whenever the user asks about movies,
+                      actors, directors or genres, CALL THOSE FUNCTIONS to find real titles. Do not answer
+                      from memory alone.
+                    - NEVER invent a MovieId. Every MovieId you return must be the numeric TMDb id that a
+                      function actually returned to you (for example "13", not "1990-Forrest-Gump").
+                    - Typical flow: SearchForPeople to resolve a person to a PersonId, then DiscoverMovies
+                      with that cast id and any date/genre filters; or SearchMovies when the user names a title.
+                    - Populate MovieList with every relevant movie you found. Return an empty MovieList only
+                      when the functions genuinely came back with no matches.
+
                     **If the user requests a trailer, preview, teaser, promo, or attraction video, always include the trailer's YouTube link in your response, embedded in-line and wrapped in [TRAILER]...[/TRAILER] tags.**  
                     For example: [TRAILER]https://www.youtube.com/watch?v=vc7_mH2PWHs[/TRAILER]
 
@@ -206,12 +217,37 @@ namespace MovieTracker.Backend.Functions
             );
         }
 
+        // These run under Task.WhenAll, so one unresolvable movie would otherwise fail the
+        // entire response. Hydration of a single entry is best-effort.
+        private async Task SafeProcessMovieAsync(JsonElement movie, List<MovieViewModel> movieItems, TMDbClient client)
+        {
+            try
+            {
+                await ProcessMovieAsync(movie, movieItems, client);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Failed to hydrate a movie entry; skipping it");
+            }
+        }
+
         private async Task ProcessMovieAsync(JsonElement movie, List<MovieViewModel> movieItems, TMDbClient client)
         {
-            var movieId = movie.GetProperty("MovieId").GetString();
-            if (movieId == null)
+            if (!movie.TryGetProperty("MovieId", out var movieIdElement))
             {
-                logger.LogWarning("MovieId is null");
+                logger.LogWarning("Movie entry has no MovieId");
+                return;
+            }
+
+            // The model sometimes emits MovieId as a number, and sometimes invents a
+            // non-numeric id entirely. Neither should take down the whole response.
+            var movieId = movieIdElement.ValueKind == JsonValueKind.Number
+                ? movieIdElement.GetRawText()
+                : movieIdElement.GetString();
+
+            if (string.IsNullOrWhiteSpace(movieId) || !int.TryParse(movieId, out var tmdbMovieId))
+            {
+                logger.LogWarning("Skipping movie with non-numeric MovieId '{MovieId}'", movieId);
                 return;
             }
 
@@ -229,13 +265,13 @@ namespace MovieTracker.Backend.Functions
             }
             else
             {
-                var tmdbMovie = await client.GetMovieAsync(int.Parse(movieId));
+                var tmdbMovie = await client.GetMovieAsync(tmdbMovieId);
                 var imdbId = tmdbMovie.ImdbId ?? "";
 
                 MovieTrailerInfo? trailerInfo = null;
                 try
                 {
-                    var videos = await client.GetMovieVideosAsync(int.Parse(movieId));
+                    var videos = await client.GetMovieVideosAsync(tmdbMovieId);
                     var trailer = videos.Results
                         .Where(v => v.Type == "Trailer" && v.Site == "YouTube")
                         .OrderByDescending(v => v.Official)
@@ -364,7 +400,7 @@ namespace MovieTracker.Backend.Functions
 
                                 foreach (var movie in movieListArray)
                                 {
-                                    tasks.Add(ProcessMovieAsync(movie, movieItems, client));
+                                    tasks.Add(SafeProcessMovieAsync(movie, movieItems, client));
                                 }
 
                                 await Task.WhenAll(tasks);

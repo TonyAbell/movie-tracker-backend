@@ -7,9 +7,10 @@ param the_movie_db_api_key string
 param adminPrincipalIds array = []
 module KeyVaultModule 'key-vault.bicep' = {
   name: 'KeyVault_Deploy'
-  params: { 
+  params: {
     location: location
     open_ai_api_key:open_ai_api_key
+    the_movie_db_api_key:the_movie_db_api_key
     adminPrincipalIds:adminPrincipalIds
   }
 }
@@ -49,7 +50,11 @@ module storageKVModule 'kv-secrets-storage.bicep' = {
 
 module FuncModule 'func.bicep' = {
   name: 'Func_Deploy'
- 
+  // func.bicep reads the AzureWebJobsStorage secret as `existing`, so the module
+  // that creates it must finish first. Without this the two deploy in parallel.
+  dependsOn: [
+    storageKVModule
+  ]
   params: {
     keyVaultName: KeyVaultModule.outputs.vaultName
     location: location
@@ -70,6 +75,22 @@ module CosmosKVModule 'kv-secrets-cosmosdb.bicep' = {
   params: {
     cosmosAccountName: CosmosModule.outputs.accountName
     cosmosDatabaseName: CosmosModule.outputs.databaseName
+    vaultName: KeyVaultModule.outputs.vaultName
+  }
+}
+
+module OpenAiModule 'openai.bicep' = {
+  name: 'OpenAI_Deploy'
+  params: {
+    location: location
+  }
+}
+
+module OpenAiKVModule 'kv-secrets-openai.bicep' = {
+  name: 'OpenAI_KeyVault_Secrets_Deploy'
+  params: {
+    openAiAccountName: OpenAiModule.outputs.accountName
+    openAiDeploymentName: OpenAiModule.outputs.deploymentName
     vaultName: KeyVaultModule.outputs.vaultName
   }
 }

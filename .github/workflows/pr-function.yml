@@ -3,6 +3,16 @@ permissions:
   id-token: write
   contents: read
 
+# Both jobs gate on the `prod` environment, so a run can sit waiting for approval indefinitely.
+# Without this, closing a PR whose deploy was still queued starts a second run, and approving both
+# together lets cleanup finish first - it has no build to do - and then the deploy it was supposed
+# to tidy up creates the app afterwards. That orphaned PR #14's app onto the production App Service
+# Plan, where nothing would ever have removed it. Grouping per PR means the close event cancels the
+# pending deploy instead of racing it.
+concurrency:
+  group: pr-function-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 on:
   pull_request:
     types: [opened, synchronize, reopened, closed]
@@ -110,34 +120,65 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-      - name: Delete Function App
+      - name: Resolve the PR's function app
         run: |
+          RG='${{ secrets.AZURE_RESOURCE_GROUP }}'
+          PR='${{ github.event.pull_request.number }}'
+
+          # Preferred: ask the deployment what it made.
           app_name=$(az deployment group show \
-            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
-            --name pr-${{ github.event.pull_request.number }} \
-            --query properties.outputs.functionAppName.value -o tsv || true)
-          if [ -n "$app_name" ]; then
-            az functionapp delete \
-              --name "$app_name" \
-              --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }}
+            --resource-group "$RG" --name "pr-$PR" \
+            --query properties.outputs.functionAppName.value -o tsv 2>/dev/null || true)
+
+          # Fallback: the deployment record may be missing entirely - the deploy job can be cancelled
+          # by the concurrency group above, or never have run. func-pr.bicep names the app
+          # deterministically as '<uniqueString>-func-movie-tracker-pr-<n>', so match on that instead
+          # of giving up and leaving the app running.
+          if [ -z "$app_name" ]; then
+            app_name=$(az resource list \
+              --resource-group "$RG" \
+              --resource-type Microsoft.Web/sites \
+              --query "[?ends_with(name, '-func-movie-tracker-pr-$PR')].name" -o tsv | head -n1)
+            [ -n "$app_name" ] && echo "no deployment record for pr-$PR; matched by name: $app_name"
           fi
-          plan_name=$(az deployment group show \
-            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
-            --name pr-${{ github.event.pull_request.number }} \
-            --query properties.outputs.functionAppId.value -o tsv \
-            | xargs basename || true)
-          if [ -n "$plan_name" ]; then
-            az resource delete \
-              --ids $(az resource list \
-                --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
-                --query "[?name=='$plan_name'].id" -o tsv) \
-              || true
-          fi
-      - name: Remove orphaned role assignments
+
+          # Steps do not share shell variables - the old role-assignment step read an $app_name that
+          # was always empty for exactly this reason.
+          echo "APP_NAME=$app_name" >> "$GITHUB_ENV"
+          [ -n "$app_name" ] || echo "nothing to clean up for PR $PR"
+
+      - name: Capture the app's managed identity
+        if: env.APP_NAME != ''
         run: |
-          resource_id=$(az functionapp show --name "$app_name" --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} --query id -o tsv || true)
-          if [ -n "$resource_id" ]; then
-            for assignment in $(az role assignment list --scope "$resource_id" --query "[].id" -o tsv); do
+          principal_id=$(az functionapp show \
+            --name "$APP_NAME" --resource-group '${{ secrets.AZURE_RESOURCE_GROUP }}' \
+            --query identity.principalId -o tsv 2>/dev/null || true)
+          echo "PRINCIPAL_ID=$principal_id" >> "$GITHUB_ENV"
+
+      # Runs BEFORE the app is deleted, while the system-assigned principal still resolves.
+      #
+      # func-pr.bicep grants Key Vault Secrets User with `scope: keyVault`, so the assignment lives on
+      # the vault - not on the app, which is where this used to look. It therefore never matched, and
+      # every merged PR left an assignment on the vault pointing at a principal that no longer exists.
+      - name: Remove the app's role assignments
+        if: env.PRINCIPAL_ID != ''
+        run: |
+          ids=$(az role assignment list --assignee "$PRINCIPAL_ID" --all --query "[].id" -o tsv || true)
+          if [ -n "$ids" ]; then
+            for assignment in $ids; do
               az role assignment delete --ids "$assignment"
             done
+            echo "removed $(echo "$ids" | wc -l) role assignment(s) for $APP_NAME"
+          else
+            echo "no role assignments found for $APP_NAME"
           fi
+
+      - name: Delete Function App
+        if: env.APP_NAME != ''
+        run: |
+          az functionapp delete \
+            --name "$APP_NAME" \
+            --resource-group '${{ secrets.AZURE_RESOURCE_GROUP }}'
+          # No App Service Plan to remove: func-pr.bicep takes the plan as an `existing` resource and
+          # shares production's. The block that used to sit here basenamed the functionAppId output -
+          # giving the app name, not a plan - and then tried to delete that same app a second time.

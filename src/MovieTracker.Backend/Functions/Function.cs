@@ -64,11 +64,7 @@ namespace MovieTracker.Backend.Functions
         string ImdbId,
         MovieTrailerInfo? Trailer
     );
-    public record MovieItem(string MovieId, string MovieName);
-    public record LLMResponse(string SystemMessage, List<MovieItem> MovieList);
-    
 
-    //public record ChatMessageRecord(string Role, string Text);
 
     [JsonPolymorphic(TypeDiscriminatorPropertyName = nameof(role))]
     [JsonDerivedType(typeof(UserChatMessage), typeDiscriminator: "user")]
@@ -134,11 +130,17 @@ namespace MovieTracker.Backend.Functions
     }
 
 
+    // The structured-output schema, and therefore the exact shape every turn must come back in.
+    //
+    // This deliberately carries no FunnyFact. It used to, and RequireAllProperties below made it
+    // mandatory, so the model paid output tokens to write one on every single turn - while
+    // ToClientMessageAsync read only SystemMessage and MovieList, and the fact the client actually
+    // receives comes from chatSession.FunnyFact, produced out of band by ChatPlanner. The field was
+    // write-only: never read, and free to contradict the real one.
     public class MovieListResponse
     {
         public string SystemMessage { get; set; }
         public List<MovieListItem> MovieList { get; set; }
-        public string FunnyFact { get; set; }
     }
 
     public class MovieListItem 
@@ -302,6 +304,9 @@ namespace MovieTracker.Backend.Functions
                       function actually returned to you (for example "13", not "1990-Forrest-Gump").
                     - Typical flow: SearchForPeople to resolve a person to a PersonId, then DiscoverMovies
                       with that cast id and any date/genre filters; or SearchMovies when the user names a title.
+                    - When the user asks for the "best", "top", "most popular", "highest grossing" or
+                      "newest" of something, pass DiscoverMovies a sortBy value rather than sorting the
+                      results yourself. Use genreMatch "any" for "X or Y" and leave it out for "X and Y".
                     - Populate MovieList with every relevant movie you found. Return an empty MovieList only
                       when the functions genuinely came back with no matches.
 

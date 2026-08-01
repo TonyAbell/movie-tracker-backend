@@ -32,27 +32,20 @@ namespace MovieTracker.Backend.Prompts
         /// Explicit tool list; see the note on TheMovieDBKernelFunctions.CreateTools.
         /// </summary>
         /// <remarks>
-        /// Four of the ten methods that carried [KernelFunction] before the migration are deliberately
-        /// no longer offered to the model. They are still called - just not by it:
-        /// <list type="bullet">
-        /// <item><description>
-        /// <see cref="GenerateEnhancedFunnyFact"/> and <see cref="GenerateFunnyFact"/> are near-duplicates
-        /// of each other, and Chat-Ask already runs the enhanced one out of band for every request. As
-        /// tools they bought nothing and cost two nested completions plus Wikipedia and Wikidata calls,
-        /// inside a tool call the model was already waiting on. The fact reaches the client through the
-        /// response's own FunnyFact field, not through the conversation.
-        /// </description></item>
-        /// <item><description>
-        /// <see cref="GenerateRequiredSteps"/> returns a fixed string restating the JSON shape, which the
-        /// system prompt states and the strict structured-output schema then enforces. A round trip to be
-        /// told something the request already guarantees.
-        /// </description></item>
-        /// <item><description>
-        /// <see cref="GetMovieRatingGeneric"/> takes the same single IMDb id as <see cref="GetMovieRating"/>
-        /// and returns the same OMDb lookup with IMDb as the primary rating. Two descriptions for one
-        /// capability is just an ambiguous choice for the model to get wrong.
-        /// </description></item>
-        /// </list>
+        /// <see cref="GenerateEnhancedFunnyFact"/> is the one method here that is still called but not
+        /// offered: Chat-Ask runs it out of band for every request, racing the main model call. As a
+        /// tool it bought nothing and cost a nested completion plus Wikipedia and Wikidata round trips
+        /// inside a call the model was already waiting on, and the fact reaches the client through the
+        /// response's own FunnyFact field rather than through the conversation.
+        ///
+        /// Three further methods were withdrawn at the migration and have since been deleted outright,
+        /// since nothing called them: GenerateFunnyFact (a stale copy of DetectEntity plus the
+        /// ungrounded fallback), GenerateRequiredSteps (a fixed string restating a JSON shape the system
+        /// prompt states and the strict schema enforces - and whose example contained a fabricated
+        /// MovieId and an ImdbId field the schema rejects), and GetMovieRatingGeneric (the same IMDb
+        /// lookup as <see cref="GetMovieRating"/> under a second description, which is just an ambiguous
+        /// choice for the model to get wrong).
+        ///
         /// The date helpers in <see cref="DateTimeKernelFunctions"/> were left alone on purpose: their
         /// schemas are tiny, and they exist precisely to stop the model inventing date ranges.
         /// </remarks>
@@ -66,15 +59,27 @@ namespace MovieTracker.Backend.Prompts
             AIFunctionFactory.Create(GetMovieContext),
         ];
 
-        [Description("Handle trailer requests and return clickable trailer links")]
-        public async Task<string> HandleTrailerRequest(string userQuery)
+        [Description("Handle a request for a movie trailer and return a clickable trailer link. " +
+                     "Only call this when the user actually asked for a trailer, teaser, preview or promo.")]
+        public async Task<string> HandleTrailerRequest(
+            [Description("The user's request, verbatim")] string userQuery)
         {
             if (trailerAgent.CanHandle(userQuery))
             {
                 return await trailerAgent.HandleRequest(userQuery);
             }
 
-            return await GenerateRequiredSteps();
+            // Used to return GenerateRequiredSteps(), a restatement of the response schema whose worked
+            // example contained "MovieId": "1" - a fabricated id of exactly the kind the system prompt
+            // forbids - plus an ImdbId field that DisallowAdditionalProperties rejects. Handing that to
+            // the model mid-conversation taught it the wrong shape. Same {Error, Hint} envelope the TMDb
+            // tools use for a correctable mistake.
+            return JsonSerializer.Serialize(new
+            {
+                Error = "That does not look like a trailer request, so no trailer was looked up.",
+                Hint = "Answer the question with the movie search tools instead. Only call " +
+                       "HandleTrailerRequest when the user asks for a trailer, teaser, preview or promo."
+            });
         }
 
         // Absorbs the description GetMovieRatingGeneric used to carry, since that near-duplicate tool is
@@ -164,62 +169,40 @@ namespace MovieTracker.Backend.Prompts
             });
         }
 
-        [Description("Get rating for a movie (uses IMDb rating as default). Use this when user asks about 'rating' without specifying the source.")]
-        [return: Description("Movie rating information with IMDb rating as the primary rating")]
-        public async Task<string> GetMovieRatingGeneric(
-            [Description("The IMDb ID of the movie")] string imdbId)
-        {
-            var result = await openMovieDbAgent.GetMovieRatings(imdbId);
-
-            if (!result.IsSuccess)
-            {
-                return JsonSerializer.Serialize(new { Error = result.ErrorMessage });
-            }
-
-            var imdbRatingDisplay = result.ImdbRating != "N/A" ? $"{result.ImdbRating}/10" : "not available";
-
-            return JsonSerializer.Serialize(new
-            {
-                Title = result.Title,
-                Year = result.Year,
-                Rating = $"IMDb rating: {imdbRatingDisplay}",
-                Note = "IMDb rating is used as the primary rating source",
-                AdditionalRatings = new
-                {
-                    RottenTomatoes = result.RottenTomatoesRating,
-                    Metacritic = result.MetacriticRating
-                },
-                Summary = $"{result.Title} ({result.Year}) has an IMDb rating of {imdbRatingDisplay}"
-            });
-        }
-
         [Description("Enhanced funny fact generator using Wikipedia data")]
         public async Task<string?> GenerateEnhancedFunnyFact(string userQuery)
         {
-            var detectedEntity = await DetectEntity(userQuery);
+            var entity = await DetectEntity(userQuery);
 
-            if (detectedEntity == "NONE") return null;
+            if (entity.IsNone) return null;
 
-            var wikipediaInfo = await wikipediaAgent.GetEnhancedInfo(detectedEntity);
+            var wikipediaInfo = await wikipediaAgent.GetEnhancedInfo(entity.Name, entity.Type);
 
-            if (wikipediaInfo?.ConfidenceScore > 0.5)
-            {
-                var enhancedPrompt = $@"
-                Based on this Wikipedia information about '{detectedEntity}':
+            // Below this bar there is nothing to ground a fact in. This used to fall back to a prompt
+            // that asked the model to invent one from memory, and the result went straight to the user
+            // as FunnyFact - confident, unsourced biographical claims about real people. It fired on
+            // every person query, because the entity type was hardcoded to "movie" and the film SPARQL
+            // never matches a human, so confidence never cleared this gate. No fact beats a made-up one:
+            // FunnyFact is optional and RunTurnAsync only overwrites it when non-null.
+            if (wikipediaInfo?.ConfidenceScore is not > 0.5) return null;
+
+            var enhancedPrompt = $@"
+                Based on this Wikipedia information about '{entity.Name}':
                 Summary: {wikipediaInfo.WikipediaContent?.Summary}
-                
+
                 Generate ONE surprising, entertaining fact that most people wouldn't know.
+                Use ONLY the information above. If it does not support an interesting fact,
+                reply with exactly NONE rather than drawing on anything else you know.
                 Keep it under 100 characters and make it engaging for movie fans.
                 ";
-                var result = await chatClient.GetResponseAsync(enhancedPrompt);
-                return result.Text?.Trim();
-            }
-
-            return await GenerateBasicFunnyFact(detectedEntity);
+            var result = await chatClient.GetResponseAsync(enhancedPrompt);
+            return NullIfNone(result.Text);
         }
 
         [Description("Gets detailed information about movies/actors for chat context")]
-        public async Task<string?> GetChatContext(string entityName, string entityType = "movie")
+        public async Task<string?> GetChatContext(
+            [Description("The exact movie title, actor name or director name to look up")] string entityName,
+            [Description("What the name refers to: 'movie', 'actor' or 'director'")] string entityType = "movie")
         {
             var wikipediaInfo = await wikipediaAgent.GetEnhancedInfo(entityName, entityType);
 
@@ -234,139 +217,110 @@ namespace MovieTracker.Backend.Prompts
             });
         }
 
-        [Description("Detects if user query mentions specific actors/movies and generates a funny fact")]
-        [return: Description("A funny fact if entities are detected, null otherwise")]
-        public async Task<string?> GenerateFunnyFact(string userQuery)
+        /// <summary>
+        /// What the user's query is actually about. The <b>type</b> is the load-bearing half:
+        /// <see cref="WikipediaSearchAgent.GetEnhancedInfo"/> picks a different Wikidata SPARQL query
+        /// per type, and every caller here used to omit it and take the "movie" default. Running the
+        /// film query (instance-of: film) against a person's name matches nothing, which zeroed the
+        /// confidence score and pushed every actor and director query onto the ungrounded fallback.
+        /// </summary>
+        private sealed record DetectedEntity(string Name, string Type)
+        {
+            public static readonly DetectedEntity None = new("NONE", "movie");
+
+            public bool IsNone => string.Equals(Name, "NONE", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private async Task<DetectedEntity> DetectEntity(string userQuery)
         {
             var entityDetectionPrompt = $@"
-            Analyze the following user query and determine if it mentions specific:
-            1. Actors/actresses by name
-            2. Movie titles
-            3. Directors
-            
-            Return ONLY the names of specific entities mentioned, or 'NONE' if no specific entities are found.
-            For generic queries like 'action movies' or 'comedies', return 'NONE'.
-            
-            User query: {userQuery}
-            
-            Examples:
-            Query: 'list movies with tom hanks in 90s' -> 'tom hanks'
-            Query: 'show me the matrix movies' -> 'the matrix'
-            Query: 'what popular movies came out last year' -> 'NONE'
-            Query: 'movies directed by Christopher Nolan' -> 'Christopher Nolan'
-            ";
-            var detectionResult = await chatClient.GetResponseAsync(entityDetectionPrompt);
-            var detectedEntity = detectionResult.Text?.Trim() ?? "NONE";
+        Analyze the following user query and determine whether it names a specific movie,
+        actor/actress, or director.
 
-            if (detectedEntity.ToUpper() == "NONE")
+        Reply with the entity name and its type separated by a single pipe: NAME|TYPE
+        TYPE must be exactly one of: movie, actor, director
+        For generic queries like 'action movies' or 'comedies', reply with exactly: NONE
+
+        User query: {userQuery}
+
+        Examples:
+        Query: 'list movies with tom hanks in 90s' -> Tom Hanks|actor
+        Query: 'show me the matrix movies' -> The Matrix|movie
+        Query: 'what popular movies came out last year' -> NONE
+        Query: 'movies directed by Christopher Nolan' -> Christopher Nolan|director
+        ";
+            var detectionResult = await chatClient.GetResponseAsync(entityDetectionPrompt);
+            return ParseDetectedEntity(detectionResult.Text);
+        }
+
+        /// <summary>
+        /// The model answers this prompt without a schema, so it quotes things, adds trailing periods
+        /// and varies the casing of NONE. The old code compared with a case-sensitive ordinal ==, which
+        /// meant a reply of 'NONE' with quotes was treated as a real entity and sent to Wikipedia.
+        /// </summary>
+        private static DetectedEntity ParseDetectedEntity(string? raw)
+        {
+            var text = raw?.Trim().Trim('\'', '"', '.', ' ') ?? string.Empty;
+            if (text.Length == 0) return DetectedEntity.None;
+
+            var parts = text.Split('|', 2, StringSplitOptions.TrimEntries);
+            var name = parts[0].Trim('\'', '"', '.', ' ');
+
+            if (name.Length == 0 || string.Equals(name, "NONE", StringComparison.OrdinalIgnoreCase))
             {
-                return null;
+                return DetectedEntity.None;
             }
 
-            var funnyFactPrompt = $@"
-            Generate ONE interesting, entertaining, or funny fact about '{detectedEntity}'.
-            The fact should be concise, surprising, and relevant to movies or acting if possible.
-            Keep it under 100 characters.
-            
-            Examples:
-            - Tom Hanks collects vintage typewriters and owns over 250 of them!
-            - The Matrix's famous green code is actually sushi recipes in Japanese.
-            - Christopher Nolan doesn't use email or a smartphone.
-            ";
+            // GetEnhancedInfo switches on exactly "movie"/"actor"/"director" and silently falls back to
+            // the movie query for anything else, so normalise the near-misses the model actually emits.
+            var type = (parts.Length > 1 ? parts[1].Trim('\'', '"', '.', ' ') : "movie").ToLowerInvariant() switch
+            {
+                "actor" or "actress" or "person" or "cast" => "actor",
+                "director" or "filmmaker" => "director",
+                _ => "movie",
+            };
 
-            var funnyFactResult = await chatClient.GetResponseAsync(funnyFactPrompt);
-            return funnyFactResult.Text?.Trim();
+            return new DetectedEntity(name, type);
         }
 
-        [Description("Returns instructions on how best to respond to the user")]
-        [return: Description("The list of steps to best respond to the user")]
-        public async Task<string> GenerateRequiredSteps()
+        /// <summary>
+        /// The grounded prompts are told to answer NONE rather than invent, so that answer has to be
+        /// recognised and turned back into a null rather than shown to the user as a fact.
+        /// </summary>
+        private static string? NullIfNone(string? text)
         {
-            string prompt = $$"""
-                Return a json object with the following properties:
-                SystemMessage: A message to the user, relevant to their request, if no movies are found, 
-                        return a message indicating that no movies were found, and give hints on how best to ask/search for movies
-                MovieList: A list of movies with the following properties MovieId and MovieName, can be an empty list if no movies are found
-                Example:
-                {
-                  "SystemMessage": "Here is the list of movies",
-                  "MovieList": [
-                    {
-                      "MovieId": "1",
-                      "MovieName": "The Movie",
-                      "ImdbId": "tt1234567"
-                    }
-                  ]
-                }
-                """;
+            var trimmed = text?.Trim();
 
-            return prompt.ToString();
-        }
-
-        private async Task<string> DetectEntity(string userQuery)
-        {
-            var entityDetectionPrompt = $@"
-        Analyze the following user query and determine if it mentions specific:
-        1. Actors/actresses by name
-        2. Movie titles
-        3. Directors
-        
-        Return ONLY the names of specific entities mentioned, or 'NONE' if no specific entities are found.
-        For generic queries like 'action movies' or 'comedies', return 'NONE'.
-        
-        User query: {userQuery}
-        
-        Examples:
-        Query: 'list movies with tom hanks in 90s' -> 'Tom Hanks'
-        Query: 'show me the matrix movies' -> 'The Matrix'
-        Query: 'what popular movies came out last year' -> 'NONE'
-        Query: 'movies directed by Christopher Nolan' -> 'Christopher Nolan'
-        ";
-            var detectionResult = await chatClient.GetResponseAsync(entityDetectionPrompt);
-            return detectionResult.Text?.Trim() ?? "NONE";
-        }
-
-        private async Task<string?> GenerateBasicFunnyFact(string detectedEntity)
-        {
-            var funnyFactPrompt = $@"
-        Generate ONE interesting, entertaining, or funny fact about '{detectedEntity}'.
-        The fact should be concise, surprising, and relevant to movies or acting if possible.
-        Keep it under 100 characters.
-        
-        Examples:
-        - Tom Hanks collects vintage typewriters and owns over 250 of them!
-        - The Matrix's famous green code is actually sushi recipes in Japanese.
-        - Christopher Nolan doesn't use email or a smartphone.
-        ";
-            var funnyFactResult = await chatClient.GetResponseAsync(funnyFactPrompt);
-            return funnyFactResult.Text?.Trim();
+            return string.IsNullOrWhiteSpace(trimmed)
+                || string.Equals(trimmed.Trim('\'', '"', '.', ' '), "NONE", StringComparison.OrdinalIgnoreCase)
+                    ? null
+                    : trimmed;
         }
 
         [Description("Provides rich context about movies/actors for enhanced responses")]
-        public async Task<string?> GetMovieContext(string userQuery)
+        public async Task<string?> GetMovieContext(
+            [Description("The user's question, used to work out which movie or person to describe")] string userQuery)
         {
-            var detectedEntity = await DetectEntity(userQuery);
+            var entity = await DetectEntity(userQuery);
 
-            if (detectedEntity == "NONE") return null;
+            if (entity.IsNone) return null;
 
-            var wikipediaInfo = await wikipediaAgent.GetEnhancedInfo(detectedEntity);
+            var wikipediaInfo = await wikipediaAgent.GetEnhancedInfo(entity.Name, entity.Type);
 
-            if (wikipediaInfo?.ConfidenceScore > 0.5)
-            {
-                var contextPrompt = $@"
-            Based on this Wikipedia information about '{detectedEntity}':
+            if (wikipediaInfo?.ConfidenceScore is not > 0.5) return null;
+
+            var contextPrompt = $@"
+            Based on this Wikipedia information about '{entity.Name}':
             Summary: {wikipediaInfo.WikipediaContent?.Summary}
             Facts: {JsonSerializer.Serialize(wikipediaInfo.StructuredData?.StructuredFacts)}
-            
-            Provide 1-2 interesting, engaging facts that would make this movie/person sound fascinating to movie fans. 
+
+            Provide 1-2 interesting, engaging facts that would make this movie/person sound fascinating to movie fans.
             Focus on surprising details, cultural impact, or behind-the-scenes stories.
+            Use ONLY the information above; reply with exactly NONE if it does not support one.
             Keep it concise but engaging.
             ";
-                var result = await chatClient.GetResponseAsync(contextPrompt);
-                return result.Text?.Trim();
-            }
-
-            return null;
+            var result = await chatClient.GetResponseAsync(contextPrompt);
+            return NullIfNone(result.Text);
         }
     }
 }

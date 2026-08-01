@@ -15,9 +15,18 @@ namespace MovieTracker.Backend.Agents
         // execution settings, which had the same effect.
         private readonly IChatClient chatClient;
 
-        private static readonly string[] TrailerKeywords = {
-            "trailer", "preview", "teaser", "video", "watch", "play", "show", "promo", "attraction video"
+        // Words that mean "video content" on their own and nothing else.
+        private static readonly string[] TrailerNouns = {
+            "trailer", "teaser", "preview", "promo", "featurette", "attraction video"
         };
+
+        // These only count when paired with one of the nouns below. The list used to include "watch",
+        // "play" and "show" as standalone triggers, which fired on a large share of perfectly ordinary
+        // queries - "show me Tom Hanks movies" routed a plain filmography question into a trailer
+        // lookup: an extra completion to extract a title, a TMDb search and a videos call, and an
+        // apology string when it found nothing.
+        private static readonly string[] PlaybackVerbs = { "watch", "play", "show", "see" };
+        private static readonly string[] VideoNouns = { "video", "footage", "clip" };
 
         public TrailerAgent(IConfiguration configuration, IChatClient chatClient)
         {
@@ -27,7 +36,16 @@ namespace MovieTracker.Backend.Agents
 
         public bool CanHandle(string userQuery)
         {
-            return TrailerKeywords.Any(k => userQuery.Contains(k, StringComparison.OrdinalIgnoreCase));
+            if (string.IsNullOrWhiteSpace(userQuery)) return false;
+
+            if (TrailerNouns.Any(noun => userQuery.Contains(noun, StringComparison.OrdinalIgnoreCase)))
+            {
+                return true;
+            }
+
+            // "watch the video", "play that clip" - the verb alone is not evidence of anything.
+            return PlaybackVerbs.Any(verb => userQuery.Contains(verb, StringComparison.OrdinalIgnoreCase))
+                && VideoNouns.Any(noun => userQuery.Contains(noun, StringComparison.OrdinalIgnoreCase));
         }
 
         public async Task<string> HandleRequest(string userQuery)

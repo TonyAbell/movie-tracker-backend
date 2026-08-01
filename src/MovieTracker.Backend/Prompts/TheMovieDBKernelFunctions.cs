@@ -13,7 +13,6 @@ namespace MovieTracker.Backend.Prompts
     public class TheMovieDBKernelFunctions(IConfiguration configuration)
     {
         private readonly string apiKey = configuration["TheMovieDb:Api-Key"] ?? throw new ArgumentNullException("Missing The Movice Db Api Key");
-        private record MovieItem(string MovieId, string MovieName);
 
         /// <summary>
         /// The Agent Framework has no equivalent of SK's Plugins.AddFromType&lt;T&gt;(), which discovered
@@ -255,8 +254,12 @@ namespace MovieTracker.Backend.Prompts
                 ReleaseDate = movie.ReleaseDate?.ToString("yyyy-MM-dd"),
                 Genres = movie.Genres.Select(g => new { Id = g.Id, Name = g.Name }).ToList(),
                 Runtime = movie.Runtime,
-                VoteAverage = movie.VoteAverage,
-                VoteCount = movie.VoteCount,
+                // Same reasoning as DescribeMovie below. This one was missed when that rename went in,
+                // which left a bare "Rating"-shaped field in a registered tool and made the system
+                // prompt's claim - "TMDb search and detail results carry a TmdbVoteAverage" - untrue
+                // for half the detail tools.
+                TmdbVoteAverage = movie.VoteAverage,
+                TmdbVoteCount = movie.VoteCount,
                 ImdbId = movie.ImdbId ?? "",
                 PosterPath = movie.PosterPath,
                 BackdropPath = movie.BackdropPath
@@ -311,7 +314,33 @@ namespace MovieTracker.Backend.Prompts
             return movieJson;
         }
 
-        [Description("Discover movies based on various filters and sort options.")]
+        /// <summary>
+        /// Maps the small vocabulary the model is given to TMDb's sort keys. Anything unrecognised
+        /// leaves the sort unset rather than throwing - same contract as <see cref="TryGetTmdbId"/>,
+        /// since an unknown sort is a degraded answer and an exception is no answer at all.
+        /// </summary>
+        private static DiscoverMovieSortBy? ParseSortBy(string? sortBy) =>
+            sortBy?.Trim().ToLowerInvariant() switch
+            {
+                "popularity" => DiscoverMovieSortBy.PopularityDesc,
+                "rating" or "vote_average" => DiscoverMovieSortBy.VoteAverageDesc,
+                "newest" or "release_date" => DiscoverMovieSortBy.PrimaryReleaseDateDesc,
+                "oldest" => DiscoverMovieSortBy.PrimaryReleaseDate,
+                "revenue" => DiscoverMovieSortBy.RevenueDesc,
+                "votes" or "vote_count" => DiscoverMovieSortBy.VoteCountDesc,
+                _ => null,
+            };
+
+        /// <summary>
+        /// TMDb ranks by raw average, so sorting by rating with no popularity floor surfaces obscure
+        /// films carrying a single 10/10 vote ahead of everything the user has heard of. Applied only
+        /// when the caller did not set its own floor.
+        /// </summary>
+        private const int RatingSortMinimumVotes = 200;
+
+        [Description("Discover movies matching filters, optionally sorted. This is the tool for " +
+                     "'best', 'top rated', 'most popular', 'highest grossing' and 'newest' questions - " +
+                     "pass sortBy rather than sorting the results yourself.")]
         [return: Description("A JSON list of movies with their properties such as MovieId, MovieName, ReleaseDate, and ImdbId.")]
         public async Task<string> DiscoverMovies(
           [Description("Optional: Start release date (YYYY-MM-DD)")] string? releaseDateFrom = null,
@@ -322,12 +351,30 @@ namespace MovieTracker.Backend.Prompts
           [Description("Optional: Minimum vote average (1-10)")] double? minVoteAverage = null,
           [Description("Optional: Maximum vote average (1-10)")] double? maxVoteAverage = null,
           [Description("Optional: Minimum vote count")] int? minVoteCount = null,
-          [Description("Optional: Maximum vote count")] int? maxVoteCount = null
+          [Description("Optional: Maximum vote count")] int? maxVoteCount = null,
+          [Description("Optional: How to order the results. One of 'popularity', 'rating', 'newest', " +
+                       "'oldest', 'revenue', 'votes'. Use 'rating' for 'best' or 'top rated' - it applies " +
+                       "a minimum vote count so obscure films with one perfect vote do not win. Note this " +
+                       "orders by the TMDb vote average, which is not the IMDb rating: to answer a rating " +
+                       "question, still call GetMovieRating or CompareMovieRatings on the results.")] string? sortBy = null,
+          [Description("Optional: 'all' (default) requires a movie to match every genre id supplied; " +
+                       "'any' matches at least one. Use 'any' for 'action or comedy'.")] string? genreMatch = null
       )
         {
             TMDbClient client = new TMDbClient(apiKey);
 
             DiscoverMovie query = client.DiscoverMoviesAsync();
+
+            var sort = ParseSortBy(sortBy);
+            if (sort.HasValue)
+            {
+                query = query.OrderBy(sort.Value);
+
+                if (sort.Value == DiscoverMovieSortBy.VoteAverageDesc && !minVoteCount.HasValue)
+                {
+                    minVoteCount = RatingSortMinimumVotes;
+                }
+            }
 
             // Apply release date filters
             if (!string.IsNullOrEmpty(releaseDateFrom))
@@ -352,13 +399,17 @@ namespace MovieTracker.Backend.Prompts
                 }
             }
 
-            // Apply genre filters
+            // Apply genre filters. "all" stays the default because "action comedy" genuinely means
+            // both; "any" exists because with only the AND form, "action or comedy movies" asked TMDb
+            // for films that are simultaneously action and comedy and came back with almost nothing.
             if (!string.IsNullOrEmpty(genreIds))
             {
                 var genreIdList = ParseIdList(genreIds);
                 if (genreIdList.Count > 0)
                 {
-                    query = query.IncludeWithAllOfGenre(genreIdList);
+                    query = string.Equals(genreMatch?.Trim(), "any", StringComparison.OrdinalIgnoreCase)
+                        ? query.IncludeWithAnyOfGenre(genreIdList)
+                        : query.IncludeWithAllOfGenre(genreIdList);
                 }
             }
 

@@ -80,15 +80,34 @@ namespace MovieTracker.Backend.Prompts
         /// without adding it here leaves it invisible to the model.
         /// [Description] attributes still drive the schema handed to the model, exactly as before.
         /// </summary>
+        /// <remarks>
+        /// Three methods are deliberately not offered:
+        /// <list type="bullet">
+        /// <item><description>
+        /// <see cref="GetMovieDetails"/> and <see cref="GetMovieWithTrailer"/> are the same
+        /// GetMovieAsync lookup as <see cref="DescribeMovie"/> under different names, projecting
+        /// overlapping but inconsistent field sets - Genres as objects in one and bare strings in
+        /// another, VoteAverage in one and TmdbVoteAverage in another. Three descriptions for one
+        /// capability is an ambiguous choice for the model to get wrong, which is exactly why
+        /// GetMovieRatingGeneric was withdrawn from ChatPlanner. DescribeMovie absorbed the fields the
+        /// other two carried, so nothing is lost. Both methods are kept - they cost nothing unregistered
+        /// and are the obvious starting point if a detail tool ever needs to be split again.
+        /// </description></item>
+        /// <item><description>
+        /// <see cref="HandleGenericTrailerRequest"/> makes no TMDb call at all - it ignores its argument
+        /// and returns a fixed "which movie did you mean?" string. That is a sentence the model can
+        /// write itself, bought at the price of a tool schema in every request and a round trip.
+        /// </description></item>
+        /// </list>
+        /// Every tool schema rides in the cached prompt prefix on every single call, so dropping three
+        /// is a permanent token saving as well as three fewer wrong turns available to the model.
+        /// </remarks>
         public IEnumerable<AITool> CreateTools() =>
         [
             AIFunctionFactory.Create(GetGenresList),
             AIFunctionFactory.Create(SearchForPeople),
             AIFunctionFactory.Create(SearchMovies),
             AIFunctionFactory.Create(GetMovieTrailers),
-            AIFunctionFactory.Create(GetMovieWithTrailer),
-            AIFunctionFactory.Create(HandleGenericTrailerRequest),
-            AIFunctionFactory.Create(GetMovieDetails),
             AIFunctionFactory.Create(SearchKeywords),
             AIFunctionFactory.Create(DescribeMovie),
             AIFunctionFactory.Create(DiscoverMovies),
@@ -327,7 +346,11 @@ namespace MovieTracker.Backend.Prompts
             return JsonSerializer.Serialize(keywordList);
         }
 
-        [Description("Returns detailed information about a specific movie in a serialized format")]
+        [Description("Get full details for one movie by its TMDb MovieId: overview, release date, genres " +
+                     "(with ids), runtime, tagline, language, top-billed cast, poster art and the ImdbId. " +
+                     "This is the single movie-detail tool - use it whenever you need more about a film " +
+                     "than a search result carries. For the rating, call GetMovieRating with the ImdbId " +
+                     "this returns.")]
         [return: Description("Serialized JSON containing information about a specific movie including ImdbId")]
         public async Task<string> DescribeMovie([Description("The movie ID of a specific movie")] string movieId)
         {
@@ -343,24 +366,26 @@ namespace MovieTracker.Backend.Prompts
                 Title = movie.Title,
                 Overview = movie.Overview,
                 ReleaseDate = movie.ReleaseDate?.ToString("yyyy-MM-dd"),
-                Genres = movie.Genres.Select(g => g.Name).ToList(),
+                // Ids as well as names, absorbed from GetMovieDetails: they are what DiscoverMovies
+                // takes, so "more like this one" does not need a second GetGenresList round trip.
+                Genres = movie.Genres.Select(g => new { Id = g.Id, Name = g.Name }).ToList(),
                 Runtime = movie.Runtime,
                 Tagline = movie.Tagline,
                 // Named for what it is. Called "Rating" this reads as *the* rating, and the model
                 // would answer "which had the highest rating?" straight from it instead of calling
                 // GetMovieRating - which is the IMDb-backed answer this app treats as the default.
                 TmdbVoteAverage = movie.VoteAverage,
+                TmdbVoteCount = movie.VoteCount,
                 Language = movie.OriginalLanguage,
                 ImdbId = movie.ImdbId ?? "",
+                PosterPath = movie.PosterPath,
+                BackdropPath = movie.BackdropPath,
                 Cast = movie.Credits?.Cast?.Take(5).Select(c => c.Name).ToList() // Top 5 cast members
             };
 
-            string movieJson = JsonSerializer.Serialize(movieData, new JsonSerializerOptions
-            {
-                WriteIndented = true
-            });
-
-            return movieJson;
+            // Not WriteIndented. This was the only payload in the file formatted that way, and the
+            // whitespace is pure token cost on the one tool that already returns the most fields.
+            return JsonSerializer.Serialize(movieData);
         }
 
         /// <summary>

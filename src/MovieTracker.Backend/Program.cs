@@ -22,6 +22,7 @@ using MovieTracker.Backend.Agents;
 using Azure.AI.OpenAI;
 using System.ClientModel;
 using System.ClientModel.Primitives;
+using TMDbLib.Client;
 
 // One string for the OTel service name, the ActivitySource, the Meter, and the sourceName handed to
 // UseOpenTelemetry below. OpenTelemetryChatClient derives both its ActivitySource and its Meter from
@@ -160,6 +161,24 @@ var host = new HostBuilder()
             return new CosmosClient(connectionString, cosmosClientOptions);
         });
         services.AddScoped<ChatSessionRepository>();
+
+        // One TMDbClient for the process, instead of the fourteen that were being constructed inline -
+        // one inside every tool method, two in TrailerAgent, two more per HTTP function. Each
+        // `new TMDbClient(apiKey)` brings its own connection pool and re-fetches TMDb's API
+        // configuration on first use, so nothing was reused across the several TMDb calls a single turn
+        // makes. Singleton rather than scoped: it holds no per-request state, and hydration already
+        // drives it concurrently under Task.WhenAll. This is also now the one place a default language
+        // or region could be set.
+        services.AddSingleton(_ =>
+        {
+            var theMovieDbApiKey = context.Configuration["TheMovieDb:Api-Key"];
+            if (string.IsNullOrEmpty(theMovieDbApiKey))
+            {
+                throw new ConfigurationErrorsException("Missing TheMovieDb:Api-Key");
+            }
+            return new TMDbClient(theMovieDbApiKey);
+        });
+
         services.AddHttpClient<WikipediaSearchAgent>();
         services.AddScoped<WikipediaSearchAgent>();
         services.AddScoped<OpenMovieDbAgent>();

@@ -7,7 +7,7 @@ namespace MovieTracker.Backend.Agents
 {
     public class TrailerAgent
     {
-        private readonly string apiKey;
+        private readonly TMDbClient tmdbClient;
 
         // The bare IChatClient, deliberately not the AIAgent: this is a single-shot extraction prompt
         // that must not inherit the agent's tool set or its JSON response format. Under Semantic
@@ -28,9 +28,9 @@ namespace MovieTracker.Backend.Agents
         private static readonly string[] PlaybackVerbs = { "watch", "play", "show", "see" };
         private static readonly string[] VideoNouns = { "video", "footage", "clip" };
 
-        public TrailerAgent(IConfiguration configuration, IChatClient chatClient)
+        public TrailerAgent(TMDbClient tmdbClient, IChatClient chatClient)
         {
-            this.apiKey = configuration["TheMovieDb:Api-Key"] ?? throw new ArgumentNullException("Missing The Movie Db Api Key");
+            this.tmdbClient = tmdbClient;
             this.chatClient = chatClient;
         }
 
@@ -85,20 +85,21 @@ namespace MovieTracker.Backend.Agents
 
         private async Task<string> SearchForMovie(string movieTitle)
         {
-            TMDbClient client = new TMDbClient(apiKey);
-            var searchResults = await client.SearchMovieAsync(movieTitle);
+            var searchResults = await tmdbClient.SearchMovieAsync(movieTitle);
 
             return searchResults.Results.FirstOrDefault()?.Id.ToString() ?? "";
         }
 
         private async Task<string> GetTrailerUrl(string movieId)
         {
-            TMDbClient client = new TMDbClient(apiKey);
-            var videos = await client.GetMovieVideosAsync(int.Parse(movieId));
+            var videos = await tmdbClient.GetMovieVideosAsync(int.Parse(movieId));
 
+            // Same ordering as ProcessMovieAsync in Function.cs, size included. Without the size tie-break
+            // the two paths could pick different trailers for the same film.
             var trailer = videos.Results
                 .Where(v => v.Type == "Trailer" && v.Site == "YouTube")
                 .OrderByDescending(v => v.Official)
+                .ThenByDescending(v => v.Size)
                 .FirstOrDefault();
 
             return trailer != null ? $"https://www.youtube.com/watch?v={trailer.Key}" : "";

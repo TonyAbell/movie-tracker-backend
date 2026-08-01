@@ -12,6 +12,7 @@ using System.Text.Json.Serialization;
 using System.Text.Json;
 using Microsoft.Extensions.Caching.Distributed;
 using TMDbLib.Client;
+using TMDbLib.Objects.Movies;
 using Microsoft.Extensions.Configuration;
 using MovieTracker.Backend.Prompts;
 using MovieTracker.Backend.Agents;
@@ -149,9 +150,8 @@ namespace MovieTracker.Backend.Functions
         public string MovieName { get; set; }
     }
 
-    public class Function(AIAgent agent, ChatPlanner chatPlanner, ChatSessionRepository chatSessionRepository, IDistributedCache cache, IConfiguration configuration, ILogger<Function> logger, Tracer tracer)
+    public class Function(AIAgent agent, ChatPlanner chatPlanner, ChatSessionRepository chatSessionRepository, IDistributedCache cache, TMDbClient tmdbClient, IConfiguration configuration, ILogger<Function> logger, Tracer tracer)
     {
-        private readonly string apiKey = configuration["TheMovieDb:Api-Key"] ?? throw new ArgumentNullException("Missing The Movice Db Api Key");
 
         // The model must answer with MovieListResponse's exact PascalCase property names: the system
         // prompt names "SystemMessage"/"MovieList" and ProcessMovieAsync reads "MovieId" back out.
@@ -303,7 +303,10 @@ namespace MovieTracker.Backend.Functions
                     - NEVER invent a MovieId. Every MovieId you return must be the numeric TMDb id that a
                       function actually returned to you (for example "13", not "1990-Forrest-Gump").
                     - Typical flow: SearchForPeople to resolve a person to a PersonId, then DiscoverMovies
-                      with that cast id and any date/genre filters; or SearchMovies when the user names a title.
+                      with that id and any date/genre filters; or SearchMovies when the user names a title.
+                    - Pass an actor's PersonId as castIds, but a director's, writer's or producer's as
+                      crewIds. TMDb keeps those credits apart, so filtering a director as cast matches
+                      nothing. "Directed by", "written by" and "films by" all mean crewIds.
                     - When the user asks for the "best", "top", "most popular", "highest grossing" or
                       "newest" of something, pass DiscoverMovies a sortBy value rather than sorting the
                       results yourself. Use genreMatch "any" for "X or Y" and leave it out for "X and Y".
@@ -374,12 +377,11 @@ namespace MovieTracker.Backend.Functions
         private async Task SafeProcessMovieAsync(
             JsonElement movie,
             List<MovieViewModel> movieItems,
-            TMDbClient client,
             ConcurrentDictionary<string, MovieViewModel> sessionCache)
         {
             try
             {
-                await ProcessMovieAsync(movie, movieItems, client, sessionCache);
+                await ProcessMovieAsync(movie, movieItems, sessionCache);
             }
             catch (Exception ex)
             {
@@ -390,7 +392,6 @@ namespace MovieTracker.Backend.Functions
         private async Task ProcessMovieAsync(
             JsonElement movie,
             List<MovieViewModel> movieItems,
-            TMDbClient client,
             ConcurrentDictionary<string, MovieViewModel> sessionCache)
         {
             if (!movie.TryGetProperty("MovieId", out var movieIdElement))
@@ -440,14 +441,16 @@ namespace MovieTracker.Backend.Functions
             }
             else
             {
-                var tmdbMovie = await client.GetMovieAsync(tmdbMovieId);
+                // Details and videos in a single request. This is the hottest TMDb path in the app - it
+                // runs once per movie per cache miss, and every movie of a fresh answer is a miss - so
+                // folding the videos call in with append_to_response halves cold-hydration traffic.
+                var tmdbMovie = await tmdbClient.GetMovieAsync(tmdbMovieId, MovieMethods.Videos);
                 var imdbId = tmdbMovie.ImdbId ?? "";
 
                 MovieTrailerInfo? trailerInfo = null;
                 try
                 {
-                    var videos = await client.GetMovieVideosAsync(tmdbMovieId);
-                    var trailer = videos.Results
+                    var trailer = tmdbMovie.Videos?.Results
                         .Where(v => v.Type == "Trailer" && v.Site == "YouTube")
                         .OrderByDescending(v => v.Official)
                         .ThenByDescending(v => v.Size)
@@ -498,7 +501,6 @@ namespace MovieTracker.Backend.Functions
         // the intermediate function-call / function-result messages, which have no text.
         private async Task<ChatMessage?> ToClientMessageAsync(
             AIChatMessage message,
-            TMDbClient client,
             ConcurrentDictionary<string, MovieViewModel> sessionCache)
         {
             var text = message.Text;
@@ -531,7 +533,7 @@ namespace MovieTracker.Backend.Functions
                     var tasks = new List<Task>();
                     foreach (var movie in movieList.EnumerateArray())
                     {
-                        tasks.Add(SafeProcessMovieAsync(movie, movieItems, client, sessionCache));
+                        tasks.Add(SafeProcessMovieAsync(movie, movieItems, sessionCache));
                     }
 
                     await Task.WhenAll(tasks);
@@ -719,7 +721,6 @@ namespace MovieTracker.Backend.Functions
             using var activity = tracer.StartActiveSpan("movie-tracker-func.chat-ask");
             try
             {
-                TMDbClient client = new TMDbClient(apiKey);
                 var ask = await req.ReadFromJsonAsync<Ask>();
                 if (ask == null)
                 {
@@ -742,7 +743,7 @@ namespace MovieTracker.Backend.Functions
                 var responseMessages = new List<ChatMessage>();
                 foreach (var message in chatSession.ChatHistory)
                 {
-                    var clientMessage = await ToClientMessageAsync(message, client, sessionCache);
+                    var clientMessage = await ToClientMessageAsync(message, sessionCache);
                     if (clientMessage != null)
                     {
                         responseMessages.Add(clientMessage);
@@ -772,7 +773,6 @@ namespace MovieTracker.Backend.Functions
             using var activity = tracer.StartActiveSpan("movie-tracker-func.chat-ask-v2");
             try
             {
-                TMDbClient client = new TMDbClient(apiKey);
                 var ask = await req.ReadFromJsonAsync<Ask>();
                 if (ask == null)
                 {
@@ -791,7 +791,7 @@ namespace MovieTracker.Backend.Functions
 
                 ChatMessage turn = newAssistantMessage == null
                     ? new AssistantChatMessage("No movies were found", [])
-                    : await ToClientMessageAsync(newAssistantMessage, client, sessionCache)
+                    : await ToClientMessageAsync(newAssistantMessage, sessionCache)
                       ?? new AssistantChatMessage("No movies were found", []);
 
                 await SaveSessionAsync(chatSession, sessionCache);

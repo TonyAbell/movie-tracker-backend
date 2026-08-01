@@ -7,6 +7,7 @@ using Microsoft.Agents.AI.Compaction;
 using Microsoft.Extensions.AI;
 using OpenTelemetry.Trace;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Text.Json.Serialization;
 using System.Text.Json;
 using Microsoft.Extensions.Caching.Distributed;
@@ -186,6 +187,22 @@ namespace MovieTracker.Backend.Functions
         // no reasoning stage at all (grok-4-1-fast-non-reasoning, gpt-oss-120b) reject the parameter
         // outright. Leave the setting unset, empty, or "default" to omit it from the request.
         private readonly string? reasoningEffort = configuration["AzureOpenAi:Reasoning-Effort"];
+
+        // Which deployment the usage belongs to. Only ever used as a low-arity metric dimension.
+        private readonly string deployedModel = configuration["AzureOpenAi:Deployment"] ?? "unknown";
+
+        // Read the same way reasoningEffort is. Null unless both rates are configured, in which case
+        // no cost metric is emitted at all - see Telemetry.CostUsd for why there are no defaults.
+        private readonly ModelPricing? modelPricing =
+            double.TryParse(configuration["AzureOpenAi:Price-Input-Per-1M"], out var inputRate)
+            && double.TryParse(configuration["AzureOpenAi:Price-Output-Per-1M"], out var outputRate)
+                ? new ModelPricing(
+                    inputRate,
+                    outputRate,
+                    double.TryParse(configuration["AzureOpenAi:Price-Cached-Input-Per-1M"], out var cachedRate)
+                        ? cachedRate
+                        : null)
+                : null;
 
         // What is STORED and what is SENT are deliberately different. Cosmos keeps every message
         // forever because the /ask contract replays the whole transcript back to the frontend; the
@@ -539,11 +556,18 @@ namespace MovieTracker.Backend.Functions
             }
         }
 
-        // Azure Monitor's token metrics on the Cognitive Services account report 0 and the OpenTelemetry
-        // gen_ai.usage spans arrive only partially, so per-turn usage is logged here where it can be
-        // read straight out of App Insights. CachedInput is the one to watch: non-zero means the static
-        // system prompt, tool schemas and JSON schema are hitting Azure OpenAI's automatic prompt cache;
-        // a persistent zero means something started varying that prefix and the discount is being lost.
+        // Azure Monitor's own token metrics on the Cognitive Services account report 0, so usage has to
+        // come from the app. Two channels on purpose, because they answer different questions:
+        //
+        //  - The log line is per turn and exact. It is what you read when investigating one request.
+        //  - gen_ai.client.token.usage (emitted by the framework, exported now that Program.cs has a
+        //    metrics pipeline) is aggregated and, crucially, NOT sampled. It is what you read for
+        //    totals, trends and alerts - the sampled `chat` spans cannot answer those.
+        //
+        // CachedInput is the one to watch either way: non-zero means the static system prompt, tool
+        // schemas and JSON schema are hitting Azure OpenAI's automatic prompt cache. Measured in
+        // production at 2,176 cached of ~2,700 input tokens on the agent calls. A persistent zero means
+        // something started varying that prefix and the discount is silently gone.
         private void LogUsage(AgentResponse result)
         {
             if (result.Usage is not { } usage)
@@ -558,6 +582,19 @@ namespace MovieTracker.Backend.Functions
                 usage.OutputTokenCount,
                 usage.ReasoningTokenCount,
                 usage.TotalTokenCount);
+
+            // The framework's histogram splits only input/output, so the cache-hit share - the single
+            // most useful number for this app's cost - is not recoverable from it. Put it on the span.
+            var activity = Activity.Current;
+            activity?.SetTag("gen_ai.usage.input_tokens", usage.InputTokenCount);
+            activity?.SetTag("gen_ai.usage.output_tokens", usage.OutputTokenCount);
+            activity?.SetTag("gen_ai.usage.cache_read.input_tokens", usage.CachedInputTokenCount);
+            activity?.SetTag("gen_ai.usage.reasoning.output_tokens", usage.ReasoningTokenCount);
+
+            if (modelPricing is { } pricing)
+            {
+                Telemetry.RecordCost(deployedModel, usage, pricing);
+            }
         }
 
         private static ConcurrentDictionary<string, MovieViewModel> LoadHydrationCache(MoviceTrackerChatSession session) =>
@@ -632,6 +669,14 @@ namespace MovieTracker.Backend.Functions
                 "Chat-Ask context: sending {IncludedMessages} of {TotalMessages} stored messages to the model",
                 modelMessages.Count, chatMessages.Count);
 
+            // Same figure as a metric, so compaction's effect is trendable rather than something you
+            // have to go and read individual log lines to see. A ratio climbing toward 1.0 means
+            // compaction has stopped saving anything and the TPM ceiling is getting closer.
+            if (chatMessages.Count > 0)
+            {
+                Telemetry.ContextRetainedRatio.Record((double)modelMessages.Count / chatMessages.Count);
+            }
+
             // session: null runs the agent statelessly - the conversation is passed in on every call
             // and the generated messages are appended back onto it. That is what the Semantic Kernel
             // version did with a ChatHistory, and it is what lets the response be rebuilt by
@@ -639,6 +684,12 @@ namespace MovieTracker.Backend.Functions
             var result = await agent.RunAsync(modelMessages, null, new ChatClientAgentRunOptions(chatOptions));
 
             LogUsage(result);
+
+            // FunctionInvokingChatClient enforces the iteration cap internally and offers no callback
+            // when it trips, so this distribution is how you tell that it is: values pressed up against
+            // MaxToolIterations mean real queries are being cut off before the model finishes.
+            Telemetry.ToolCallsPerTurn.Record(
+                result.Messages.SelectMany(message => message.Contents).OfType<FunctionCallContent>().Count());
 
             // Includes the intermediate function-call and function-result messages as well as the
             // final answer. They carry no text, so the transcript skips them, but they must be

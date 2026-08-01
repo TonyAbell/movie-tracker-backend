@@ -3,6 +3,7 @@ using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 using System.Configuration;
@@ -22,8 +23,12 @@ using Azure.AI.OpenAI;
 using System.ClientModel;
 using System.ClientModel.Primitives;
 
-var serviceName = "movie-tracker-backend";
-var serviceVersion = "1.0.0";
+// One string for the OTel service name, the ActivitySource, the Meter, and the sourceName handed to
+// UseOpenTelemetry below. OpenTelemetryChatClient derives both its ActivitySource and its Meter from
+// that sourceName, so this single value is what makes one AddSource/AddMeter pair cover the model
+// spans, the framework's gen_ai histograms, and this app's own instruments.
+var serviceName = Telemetry.SourceName;
+var serviceVersion = Telemetry.ServiceVersion;
 
 // FunctionInvokingChatClient allows 40 tool-calling iterations per request by default. At a few
 // seconds per round trip that exhausts the 120s HttpClient budget, and then the platform's ~230s
@@ -50,7 +55,7 @@ var host = new HostBuilder()
 
     })
     .ConfigureFunctionsWebApplication()
-    .ConfigureLogging(logging =>
+    .ConfigureLogging((context, logging) =>
     {
         logging.Services.Configure<LoggerFilterOptions>(options =>
         {
@@ -61,12 +66,63 @@ var host = new HostBuilder()
                 options.Rules.Remove(defaultRule);
             }
         });
+
+        // Worker ILogger output -> Azure Monitor.
+        //
+        // Registered on the logging builder, NOT via AddOpenTelemetry().WithLogging(...) in
+        // ConfigureServices. That distinction is the whole fix and it is not cosmetic: with the
+        // exporter attached through WithLogging, application categories never reached App Insights at
+        // all - polled for eight minutes across several runs and got nothing from MovieTracker.* while
+        // Microsoft.AspNetCore.* from the same process arrived fine. Registered here, a processor on
+        // this pipeline sees MovieTracker.Backend.Functions.Function at Information/Warning/Error and
+        // MovieTracker.Backend.ChatSessionRepository at Critical, which is the path that carries
+        // production exceptions.
+        //
+        // Note the worker's ILogger output does not reach the `func start` console either way, so the
+        // console is not a way to check this - query App Insights.
+        //
+        // IncludeFormattedMessage is required or messages render as the raw template with
+        // {Placeholders} intact. Scopes carry the Functions invocation id, which is what ties a log
+        // line back to its request.
+        logging.AddOpenTelemetry(options =>
+        {
+            options.IncludeFormattedMessage = true;
+            options.IncludeScopes = true;
+            options.SetResourceBuilder(ResourceBuilder.CreateDefault()
+                .AddService(serviceName: serviceName, serviceVersion: serviceVersion));
+            options.AddAzureMonitorLogExporter(exporter =>
+            {
+                exporter.ConnectionString = context.Configuration["APPLICATIONINSIGHTS-CONNECTION-STRING"];
+
+                // The second half of the fix, and the non-obvious one. The exporter defaults to a
+                // trace-based logs sampler: a log record correlated to a trace that got sampled OUT is
+                // dropped on the floor. host.json enables adaptive sampling with only Request excluded,
+                // so most spans are discarded - and with them went every log line written inside a
+                // function invocation, which is all of the interesting ones.
+                //
+                // Proven rather than guessed: a warning on the MovieTracker category emitted at startup
+                // with Activity.Current == null arrives in App Insights; the identical category logged
+                // inside Chat-Ask does not. Same logger, same level, same exporter - only the ambient
+                // Activity differs. Turning this off decouples log retention from trace sampling, which
+                // is what you want for exception logs: an error is worth keeping even when its trace
+                // was not.
+                exporter.EnableTraceBasedLogsSampler = false;
+            });
+        });
     })
     .ConfigureServices((context, services) =>
     {
         services.AddDistributedMemoryCache();
         services.AddApplicationInsightsTelemetryWorkerService();
         services.ConfigureFunctionsApplicationInsights();
+
+        // Prompts and completions in traces. Defaults to true, which is what this app has always done
+        // and what makes the traces worth reading, but it is now a switch rather than a recompile: it
+        // puts the user's questions and the model's answers into App Insights, so set it false if the
+        // deployment ever handles data that should not land in telemetry.
+        var enableSensitiveTelemetry =
+            context.Configuration.GetValue<bool?>("Telemetry:Enable-Sensitive-Data") ?? true;
+
         // This named client is used only by the Azure OpenAI chat client behind the agent.
         // The standard resilience handler defaults to a 30s total / 10s per-attempt timeout,
         // which a reasoning model comfortably exceeds, so the budget is widened here.
@@ -148,13 +204,31 @@ var host = new HostBuilder()
 
             // GetChatClient returns the OpenAI SDK's ChatClient, not an IChatClient - AsIChatClient
             // is the required adapter.
+            // OTel is enabled HERE, on the chat client, and deliberately NOT on the agent as well.
+            // Replaces the Microsoft.SemanticKernel.Experimental.GenAI.EnableOTelDiagnosticsSensitive
+            // AppContext switch.
+            // AIAgentBuilder.UseOpenTelemetry wires an OpenTelemetryAgent whose autoWireChatClient
+            // also instruments the inner chat client, so stacking the two records
+            // gen_ai.client.token.usage twice per model call - measured 6 measurements for 2 calls
+            // instead of 4, i.e. every token and cost figure inflated by 50%. Agent-level OTel on its
+            // own has the same problem for the same reason.
             return azureOpenAiClient
                 .GetChatClient(azureOpenAiDeployment)
                 .AsIChatClient()
                 .AsBuilder()
-                // Replaces the Microsoft.SemanticKernel.Experimental.GenAI.EnableOTelDiagnosticsSensitive
-                // AppContext switch: emits GenAI spans and includes prompts and completions in them.
-                .UseOpenTelemetry(loggerFactory, serviceName, options => options.EnableSensitiveData = true)
+                // Registered explicitly so MaximumIterationsPerRequest can be set. ChatClientAgent
+                // adds function invocation itself when the chat client has none, but gives no way to
+                // configure it, and it defaults to 40 iterations - at a few seconds per round trip
+                // that burns the 120s HttpClient budget and then the platform's ~230s trigger limit,
+                // so the caller gets a timeout instead of an answer. A real query needs far fewer:
+                // resolve a person, discover, fetch details, sometimes ratings.
+                //
+                // Registering it here does NOT produce a second function-invocation layer: the agent
+                // detects the existing one and leaves it alone (verified - one orchestrate_tools span,
+                // and the cap is honoured).
+                .UseFunctionInvocation(loggerFactory, client =>
+                    client.MaximumIterationsPerRequest = MaxToolIterations)
+                .UseOpenTelemetry(loggerFactory, serviceName, options => options.EnableSensitiveData = enableSensitiveTelemetry)
                 .Build(serviceProvider);
         });
 
@@ -170,18 +244,30 @@ var host = new HostBuilder()
             var theMovieDbFunctions = serviceProvider.GetRequiredService<TheMovieDBKernelFunctions>();
             var chatPlanner = serviceProvider.GetRequiredService<ChatPlanner>();
 
+            // Wrapped for per-tool duration and failure metrics. The framework traces tool calls but
+            // emits no tool metric, and traces are sampled - so without this there is no reliable way
+            // to see that, say, OMDb has started timing out. InstrumentedAIFunction forwards name,
+            // description and schema untouched, so the model sees exactly the same 23 tools.
             List<AITool> tools =
             [
                 .. theMovieDbFunctions.CreateTools(),
                 .. DateTimeKernelFunctions.CreateTools(),
                 .. chatPlanner.CreateTools(),
             ];
-
-            var agentLogger = serviceProvider.GetRequiredService<ILogger<Program>>();
+            tools = [.. tools.Select(tool =>
+                tool is AIFunction function ? new InstrumentedAIFunction(function) : tool)];
 
             // ChatClientAgent decorates the chat client with automatic function invocation by default,
-            // which is what ToolCallBehavior.AutoInvokeKernelFunctions used to switch on.
-            var agent = chatClient.AsAIAgent(
+            // which is what ToolCallBehavior.AutoInvokeKernelFunctions used to switch on. The
+            // iteration cap it runs under is configured on the chat client above.
+            //
+            // There is deliberately no AIAgentBuilder.Use(...) middleware here. That is the documented
+            // way to intercept tool calls and it does compile, but on Microsoft.Agents.AI 1.15.0 the
+            // callback is simply never invoked - measured zero invocations across a turn in which the
+            // tool definitely ran, with and without a service provider. The iteration cap that used to
+            // live in it was therefore doing nothing at all; it is now MaximumIterationsPerRequest,
+            // and the per-tool telemetry is in InstrumentedAIFunction. Both are verified to fire.
+            return chatClient.AsAIAgent(
                 new ChatClientAgentOptions
                 {
                     Name = serviceName,
@@ -189,64 +275,56 @@ var host = new HostBuilder()
                 },
                 serviceProvider.GetRequiredService<ILoggerFactory>(),
                 serviceProvider);
-
-            // Function-invocation middleware. Wraps each individual tool call, so Iteration is the
-            // model's round-trip count within this request; Terminate ends the loop and returns what
-            // the model has produced so far, which Chat-Ask degrades gracefully on. AsBuilder().Build()
-            // returns a NEW agent - the result has to be what gets registered, or none of this runs.
-            return agent
-                .AsBuilder()
-                .Use(async (
-                    AIAgent invokedAgent,
-                    FunctionInvocationContext context,
-                    Func<FunctionInvocationContext, CancellationToken, ValueTask<object?>> next,
-                    CancellationToken cancellationToken) =>
-                {
-                    if (context.Iteration >= MaxToolIterations)
-                    {
-                        agentLogger.LogWarning(
-                            "Tool-call budget of {MaxToolIterations} iterations exhausted at {FunctionName}; ending the turn",
-                            MaxToolIterations, context.Function.Name);
-
-                        context.Terminate = true;
-                        return $"Tool-call budget exhausted. Answer with the information already gathered.";
-                    }
-
-                    return await next(context, cancellationToken);
-                })
-                .Build(serviceProvider);
         });
+        var appInsightsConnectionString = context.Configuration["APPLICATIONINSIGHTS-CONNECTION-STRING"];
+        var telemetryResource = ResourceBuilder.CreateDefault()
+            .AddService(serviceName: serviceName, serviceVersion: serviceVersion);
+
         services.AddOpenTelemetry()
                  .WithTracing((builder) =>
                  {
-                     // serviceName also covers the model spans: it is the source name passed to
-                     // UseOpenTelemetry on the chat client above.
+                     // serviceName covers this app's own spans (the Tracer used in Function.cs and
+                     // ChatSessionRepository) AND every span the framework emits - `chat`,
+                     // `orchestrate_tools`, and one `execute_tool <name>` per tool call - because it is
+                     // the sourceName passed to UseOpenTelemetry on the chat client, and that string
+                     // names the framework's ActivitySource too.
+                     //
+                     // The Microsoft.Extensions.AI*/Microsoft.Agents.AI* entries carry nothing while an
+                     // explicit sourceName is set; they are kept only so telemetry survives if that
+                     // argument is ever dropped and the sources revert to their Experimental.* defaults.
                      builder.AddSource(serviceName)
                             .AddSource("Microsoft.Extensions.AI*")
                             .AddSource("Microsoft.Agents.AI*")
                             .AddSource("Azure.AI.OpenAI*")
                             .AddSource("OpenAI*")
-                            .SetResourceBuilder(ResourceBuilder.CreateDefault()
-                            .AddService(serviceName: serviceName, serviceVersion: serviceVersion))
+                            .SetResourceBuilder(telemetryResource)
                             .AddAspNetCoreInstrumentation()
                             .AddHttpClientInstrumentation()
-                            .AddAzureMonitorTraceExporter(options => options.ConnectionString = context.Configuration["APPLICATIONINSIGHTS-CONNECTION-STRING"]);
-                     //.AddAzureMonitorTraceExporter(configure =>
-                     //{
-                     //    configure.ConnectionString = context.Configuration["APPLICATIONINSIGHTS-CONNECTION-STRING"];
-                     //});
+                            .AddAzureMonitorTraceExporter(options => options.ConnectionString = appInsightsConnectionString);
                  })
-               .WithLogging(builder =>
-               {
-
-               })
-               .UseFunctionsWorkerDefaults();
-               //.UseAzureMonitor(configure =>
-               //{
-               //    configure.ConnectionString = context.Configuration["APPLICATIONINSIGHTS-CONNECTION-STRING"];
-               //});
+                 // Traces are sampled; metrics are not. That distinction is the whole reason this
+                 // pipeline exists. OpenTelemetryChatClient has always emitted
+                 // gen_ai.client.token.usage and gen_ai.client.operation.duration off the same Meter
+                 // name as its ActivitySource, but with no MeterProvider and no AddMeter they went
+                 // nowhere - leaving sampled `chat` spans as the only record of token usage, which is
+                 // useless for totals (a spot check found 5 surviving spans against 107 real calls).
+                 // Anything that needs to be *counted* rather than *inspected* - tokens, cost, tool
+                 // failure rates - has to be read from here, and alerts should be built on these.
+                 .WithMetrics((builder) =>
+                 {
+                     builder.AddMeter(serviceName)
+                            .SetResourceBuilder(telemetryResource)
+                            .AddHttpClientInstrumentation()
+                            .AddAzureMonitorMetricExporter(options => options.ConnectionString = appInsightsConnectionString);
+                 })
+                 // Logs are NOT configured here. The empty .WithLogging(builder => { }) that used to
+                 // sit at this spot had no exporter, which is why no MovieTracker.* category has ever
+                 // appeared in App Insights and why every LogCritical in the HTTP catch blocks was
+                 // silently swallowed. Adding the exporter here does not fix it either - see the
+                 // logging.AddOpenTelemetry(...) call in ConfigureLogging above, which does.
+                 .UseFunctionsWorkerDefaults();
         })
-       
+
     .Build();
 
 host.Run();

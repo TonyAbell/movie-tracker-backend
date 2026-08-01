@@ -103,14 +103,27 @@ namespace MovieTracker.Backend.Prompts
                 return JsonSerializer.Serialize(new { Error = result.ErrorMessage });
             }
 
+            // Everything below BoxOffice already arrived in the same OMDb response and used to be
+            // discarded. The system prompt asks for trivia, awards and behind-the-scenes colour, and
+            // this is the one tool call that reliably has it - "Won 4 Oscars", the director, the
+            // certificate and the runtime, at no extra HTTP cost.
             return JsonSerializer.Serialize(new
             {
                 Title = result.Title,
                 Year = result.Year,
                 ImdbRating = result.ImdbRating,
+                ImdbVotes = result.ImdbVotes,
                 RottenTomatoesRating = result.RottenTomatoesRating,
                 MetacriticRating = result.MetacriticRating,
                 BoxOffice = result.BoxOffice,
+                Rated = result.Rated,
+                Runtime = result.Runtime,
+                Genre = result.Genre,
+                Director = result.Director,
+                Writer = result.Writer,
+                Actors = result.Actors,
+                Awards = result.Awards,
+                Plot = result.Plot,
                 Summary = $"{result.Title} ({result.Year}) has an IMDb rating of {result.ImdbRating}"
             });
         }
@@ -132,12 +145,17 @@ namespace MovieTracker.Backend.Prompts
             {
                 Winner = result.HighestRatedTitle,
                 HighestRating = result.HighestRating,
+                // Deliberately leaner than GetMovieRating: this is a list, and Plot/Actors/Writer per
+                // entry would multiply the context cost of a comparison by the number of films. Awards
+                // is the one that earns its place - it is short and it is what makes a comparison
+                // interesting rather than just two numbers.
                 AllMovies = result.AllMovies.Select(m => new
                 {
                     Title = $"{m.Title} ({m.Year})",
                     ImdbRating = m.ImdbRating,
                     RottenTomatoesRating = m.RottenTomatoesRating,
-                    MetacriticRating = m.MetacriticRating
+                    MetacriticRating = m.MetacriticRating,
+                    Awards = m.Awards
                 }),
                 Summary = $"{result.HighestRatedTitle} has the highest IMDb rating of {result.HighestRating}"
             });

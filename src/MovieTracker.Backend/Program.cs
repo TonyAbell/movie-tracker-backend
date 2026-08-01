@@ -22,6 +22,7 @@ using MovieTracker.Backend.Agents;
 using Azure.AI.OpenAI;
 using System.ClientModel;
 using System.ClientModel.Primitives;
+using System.Net.Http.Headers;
 using TMDbLib.Client;
 
 // One string for the OTel service name, the ActivitySource, the Meter, and the sourceName handed to
@@ -179,8 +180,29 @@ var host = new HostBuilder()
             return new TMDbClient(theMovieDbApiKey);
         });
 
-        services.AddHttpClient<WikipediaSearchAgent>();
-        services.AddScoped<WikipediaSearchAgent>();
+        // The User-Agent is not decoration. Wikimedia's API etiquette requires a descriptive one and
+        // enforces it: measured, both en.wikipedia.org/api/rest_v1 and query.wikidata.org answer
+        // 403 Forbidden to a request without it, and 200 to the identical request with it.
+        // AddHttpClient<T>() sets none, so every Wikipedia summary and every SPARQL query this app has
+        // ever made was rejected. SearchWikipedia returned null, the confidence score was always 0, and
+        // the funny fact fell through to the ungrounded fallback every single time - which is the real
+        // reason it was inventing biography. The entity-type bug fixed earlier was real but secondary;
+        // this is what made the grounded path unreachable for movies as well as people.
+        services.AddHttpClient<WikipediaSearchAgent>(httpClient =>
+        {
+            httpClient.DefaultRequestHeaders.UserAgent.Add(
+                new ProductInfoHeaderValue(serviceName, serviceVersion));
+            httpClient.DefaultRequestHeaders.UserAgent.Add(
+                new ProductInfoHeaderValue("(+https://github.com/TonyAbell/movie-tracker-backend)"));
+
+            // Wikidata's public endpoint is slow under load and this races the main model call, so it
+            // must never be the thing that holds a turn open.
+            httpClient.Timeout = TimeSpan.FromSeconds(15);
+        });
+        // No AddScoped<WikipediaSearchAgent>() here. AddHttpClient<T> already registers T, and adding a
+        // second descriptor for the same type shadows it - last registration wins, so the agent was
+        // being activated with an HttpClient that had none of the configuration above. The typed-client
+        // registration is the one that must resolve, so this is the only registration it gets.
         services.AddScoped<OpenMovieDbAgent>();
         services.AddScoped<TrailerAgent>();
         // The raw model connection. Registered separately from the agent because the funny-fact and
@@ -266,7 +288,7 @@ var host = new HostBuilder()
             // Wrapped for per-tool duration and failure metrics. The framework traces tool calls but
             // emits no tool metric, and traces are sampled - so without this there is no reliable way
             // to see that, say, OMDb has started timing out. InstrumentedAIFunction forwards name,
-            // description and schema untouched, so the model sees exactly the same 23 tools.
+            // description and schema untouched, so the model sees exactly the same 20 tools.
             List<AITool> tools =
             [
                 .. theMovieDbFunctions.CreateTools(),

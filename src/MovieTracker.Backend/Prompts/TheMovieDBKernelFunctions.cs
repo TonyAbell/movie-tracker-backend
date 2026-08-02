@@ -1,5 +1,6 @@
 ﻿using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Configuration;
+using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Text.Json;
 using TMDbLib.Client;
@@ -26,50 +27,35 @@ namespace MovieTracker.Backend.Prompts
         private const int MaxPersonCredits = 25;
 
         /// <summary>
-        /// Resolves the IMDb id for each search hit and projects the pair into a MovieSearchResult.
+        /// Resolves TMDb movie ids to IMDb ids, concurrently, bounded by
+        /// <see cref="MaxConcurrentTmdbCalls"/>.
         /// <para>
-        /// TMDb has no batch endpoint for external ids, so this is one call per result either way - but
-        /// it used to be one call per result <i>sequentially</i>, inside a foreach, in both list-returning
-        /// tools. That put up to twenty round trips on the critical path of a single tool call: measured
-        /// in production at 0.91s mean for SearchMovies and 0.99s for DiscoverMovies, which is what ~21
-        /// serial ~40ms calls costs. Running them concurrently is the whole difference.
+        /// TMDb has no batch endpoint for external ids, so this is one call per movie either way - but
+        /// it used to be one call per movie <i>sequentially</i>, inside a foreach. That put up to twenty
+        /// round trips on the critical path of a single tool call: measured in production at 0.91s mean
+        /// for SearchMovies and 0.99s for DiscoverMovies, which is what ~21 serial ~40ms calls costs.
+        /// Benchmarked on 20-result searches, concurrent is 2182ms -> 208ms, 2375 -> 148, 2218 -> 106.
         /// </para>
         /// <para>
-        /// Results are written by index rather than appended, so the order TMDb ranked them in survives.
+        /// An id that cannot be resolved maps to "" rather than failing the batch: the model can still
+        /// use the MovieId, and one missing IMDb id should not lose the other nineteen results.
         /// </para>
         /// </summary>
-        private static async Task<List<MovieSearchResult>> ToSearchResultsAsync<T>(
-            IReadOnlyList<T> movies,
-            Func<T, int> getId,
-            Func<T, string?> getTitle,
-            Func<T, DateTime?> getReleaseDate,
-            Func<int, Task<string?>> getImdbId)
+        private async Task<Dictionary<int, string>> ResolveImdbIdsAsync(IEnumerable<int> movieIds)
         {
-            var results = new MovieSearchResult[movies.Count];
+            var resolved = new ConcurrentDictionary<int, string>();
             using var throttle = new SemaphoreSlim(MaxConcurrentTmdbCalls);
 
-            await Task.WhenAll(movies.Select(async (movie, index) =>
+            await Task.WhenAll(movieIds.Distinct().Select(async movieId =>
             {
                 await throttle.WaitAsync();
                 try
                 {
-                    string imdbId;
-                    try
-                    {
-                        imdbId = await getImdbId(getId(movie)) ?? "";
-                    }
-                    catch
-                    {
-                        // One unresolvable external id must not fail the whole lookup; the model can
-                        // still use the MovieId, and DescribeMovie will surface the IMDb id if needed.
-                        imdbId = "";
-                    }
-
-                    results[index] = new MovieSearchResult(
-                        getId(movie).ToString(),
-                        getTitle(movie) ?? "",
-                        getReleaseDate(movie)?.ToString("yyyy-MM-dd") ?? "",
-                        imdbId);
+                    resolved[movieId] = (await client.GetMovieExternalIdsAsync(movieId)).ImdbId ?? "";
+                }
+                catch
+                {
+                    resolved[movieId] = "";
                 }
                 finally
                 {
@@ -77,7 +63,26 @@ namespace MovieTracker.Backend.Prompts
                 }
             }));
 
-            return [.. results];
+            return new Dictionary<int, string>(resolved);
+        }
+
+        /// <summary>
+        /// Projects search hits into MovieSearchResults, resolving IMDb ids concurrently. Written by
+        /// index rather than appended, so the order TMDb ranked them in survives.
+        /// </summary>
+        private async Task<List<MovieSearchResult>> ToSearchResultsAsync<T>(
+            IReadOnlyList<T> movies,
+            Func<T, int> getId,
+            Func<T, string?> getTitle,
+            Func<T, DateTime?> getReleaseDate)
+        {
+            var imdbIds = await ResolveImdbIdsAsync(movies.Select(getId));
+
+            return [.. movies.Select(movie => new MovieSearchResult(
+                getId(movie).ToString(),
+                getTitle(movie) ?? "",
+                getReleaseDate(movie)?.ToString("yyyy-MM-dd") ?? "",
+                imdbIds.TryGetValue(getId(movie), out var imdbId) ? imdbId : ""))];
         }
 
         /// <summary>
@@ -198,7 +203,7 @@ namespace MovieTracker.Backend.Prompts
                      "'what has X been in', because it is the only one that can tell a directing credit " +
                      "from a writing or producing one - pass job='Director' for 'directed by'. Prefer " +
                      "this over DiscoverMovies(crewIds:) for any question about one person's own work.")]
-        [return: Description("JSON with the person's credits: MovieId, MovieName, ReleaseDate and either Character (acting) or Job")]
+        [return: Description("JSON with the person's credits: MovieId, MovieName, ReleaseDate, ImdbId, and either Character (acting) or Job")]
         public async Task<string> GetPersonMovieCredits(
             [Description("The TMDb PersonId, as returned by SearchForPeople")] string personId,
             [Description("Optional: keep only credits with this exact job, e.g. 'Director', 'Screenplay', " +
@@ -261,9 +266,27 @@ namespace MovieTracker.Backend.Prompts
                 .ThenByDescending(credit => credit.Date)
                 .ToList();
 
-            var shown = all.Take(MaxPersonCredits)
-                .Select(c => new { c.MovieId, c.MovieName, c.ReleaseDate, c.Credit })
-                .ToList();
+            var capped = all.Take(MaxPersonCredits).ToList();
+
+            // Resolve the IMDb ids here rather than telling the model to go and fetch them.
+            //
+            // The first version of this method omitted ImdbId and pointed the model at DescribeMovie,
+            // reasoning that skipping the fan-out was cheaper. Measured on the deployed app, it was the
+            // opposite: the model dutifully called DescribeMovie once per film, and tool calls per turn
+            // went from a max of 3 to a max of 10 against a cap of 12. The N+1 had not gone away, it had
+            // moved from HTTP round trips into *model* iterations - roughly 1s each instead of 40ms, and
+            // charged against the iteration budget, where running out truncates the answer.
+            var imdbIds = await ResolveImdbIdsAsync(
+                capped.Select(credit => int.TryParse(credit.MovieId, out var id) ? id : 0).Where(id => id > 0));
+
+            var shown = capped.Select(credit => new
+            {
+                credit.MovieId,
+                credit.MovieName,
+                credit.ReleaseDate,
+                credit.Credit,
+                ImdbId = int.TryParse(credit.MovieId, out var id) && imdbIds.TryGetValue(id, out var imdb) ? imdb : "",
+            }).ToList();
 
             return JsonSerializer.Serialize(new
             {
@@ -277,7 +300,8 @@ namespace MovieTracker.Backend.Prompts
                 Note = all.Count > shown.Count
                     ? $"Showing {shown.Count} of {all.Count} matching credits, best known first."
                     : "Complete list for this filter.",
-                Hint = "These carry no ImdbId. Call DescribeMovie with a MovieId to get one for GetMovieRating."
+                Hint = "ImdbId is included - pass it straight to GetMovieRating or CompareMovieRatings. "
+                     + "No need to call DescribeMovie first."
             });
         }
 
@@ -306,8 +330,7 @@ namespace MovieTracker.Backend.Prompts
                 searchResults.Results,
                 movie => movie.Id,
                 movie => movie.Title,
-                movie => movie.ReleaseDate,
-                async id => (await client.GetMovieExternalIdsAsync(id)).ImdbId);
+                movie => movie.ReleaseDate);
 
             return JsonSerializer.Serialize(movieSearchResults);
         }
@@ -688,8 +711,7 @@ namespace MovieTracker.Backend.Prompts
                 searchResults.Results,
                 movie => movie.Id,
                 movie => movie.Title,
-                movie => movie.ReleaseDate,
-                async id => (await client.GetMovieExternalIdsAsync(id)).ImdbId);
+                movie => movie.ReleaseDate);
 
             return JsonSerializer.Serialize(movieList);
         }

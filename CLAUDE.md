@@ -57,13 +57,19 @@ Three HTTP functions, all in `Functions/Function.cs`:
 
 Both ask routes share `RunTurnAsync`. They differ only in how much of the conversation they hydrate afterwards.
 
+`MovieListResponse` carries **only** `SystemMessage` and `MovieList`. It used to have a `FunnyFact` too, which `RequireAllProperties` made mandatory — so the model paid output tokens for it every turn while `ToClientMessageAsync` read only the other two and the fact the client sees came from `chatSession.FunnyFact` out of band. Adding a field here costs a completion on every request; only add one something actually reads.
+
 **Structured-output trap.** `MovieListResponseFormat` in `Function.cs` is built with `AIJsonUtilities.CreateJsonSchema` and `AIJsonSchemaTransformOptions { DisallowAdditionalProperties = true, RequireAllProperties = true }`, not with the obvious `ChatResponseFormat.ForJsonSchema(typeof(MovieListResponse), ...)`. The convenient overload emits a schema with no `required` array and no `additionalProperties: false`, which Azure OpenAI's strict structured outputs reject with HTTP 400 — Semantic Kernel's `ResponseFormat = typeof(T)` used to emit the strict dialect for you. The serializer options also pin `PropertyNamingPolicy = null`, because Microsoft.Extensions.AI defaults to camelCase and the system prompt and `ProcessMovieAsync` both depend on PascalCase `SystemMessage`/`MovieList`/`MovieId`.
 
 Hydration is the key two-layer design: the LLM only ever returns TMDb movie IDs; `ProcessMovieAsync` fans out over them, calls TMDbLib for full details plus the best YouTube trailer, and builds the `MovieViewModel` the frontend consumes. Lookup is three tiers, in order:
 
+`MovieViewModel`'s trailing `GenreNames`, `Runtime` and `Tagline` are additive and **nullable on purpose**: `HydratedMovies` persists in Cosmos across deploys, so documents written before a field existed deserialize it as null. A null `GenreNames` means "unknown", not "no genres" — any new field here inherits that constraint.
+
 1. `MoviceTrackerChatSession.HydratedMovies` — a `Dictionary<string, MovieViewModel>` **stored in the session's own Cosmos document**, so it arrives free with the load at the top of the request and survives restarts and scale-out. Capped at `HydratedMovieLimit` (150) purely to bound document size; anything evicted is simply re-fetched.
 2. `IDistributedCache` — `AddDistributedMemoryCache`, so process-wide and shared across sessions, but cold on every new instance.
-3. TMDb — two round trips per movie (details + videos).
+3. TMDb — **one** round trip per movie: `GetMovieAsync(id, MovieMethods.Videos)`. It was two (details, then videos) until append-to-response was wired up; this is the hottest TMDb path in the app, since every movie of a fresh answer is a cache miss.
+
+Hydration writes into a pre-sized array **by index**, not by appending under a lock. The tasks run concurrently, so appending produced completion order and silently discarded the ordering the model chose — an answer that says "best first" would render shuffled.
 
 Tier 1 is what stops `/ask` re-fetching every movie of every past turn from TMDb on every call. Without it, TMDb traffic grows with conversation length and is cold on each new instance. A single `/ask` runs roughly 5–10s.
 
@@ -83,14 +89,17 @@ Things worth knowing before touching it:
 
 - **`CompactionMessageIndex` is not public.** The strategies operate on it, but the only supported way to run one over a `List<ChatMessage>` is `AsChatReducer()`. There is no public `CompactionMessageIndex.Create`.
 - The whole `Microsoft.Agents.AI.Compaction` namespace is gated behind **`MAAI001`** (evaluation-only) and is the one preview API this project depends on. The pragmas are scoped, the way `OPENAI001` is around `ReasoningEffortLevel`.
-- **The default `ToolCallFormatter` is close to useless here.** It inlines every tool result verbatim, which is fine for `"Sunny and 72F"` and not for a twenty-movie `DiscoverMovies` array — measured on a synthetic six-turn conversation it reduced context by 3%. The custom `SummariseToolCalls` truncates each result to `CollapsedToolResultChars` and gets 68% on the same input (41% at two turns, 90% at thirty).
+- **The default `ToolCallFormatter` is close to useless here.** It inlines every tool result verbatim, which is fine for `"Sunny and 72F"` and not for a twenty-movie `DiscoverMovies` array — measured on a synthetic six-turn conversation it reduced context by 3%. The custom `SummariseToolCalls` gets 68% on the same input (41% at two turns, 90% at thirty).
+- `SummariseToolCalls` records the **call arguments** and reduces array results to a count plus the leading names, rather than truncating raw JSON. The truncation-only version dropped arguments entirely, so a later turn could see that `DiscoverMovies` had been called twice but not that one was a cast filter and the other a genre filter — and 160 chars of a movie array is about one and a half objects of mid-array noise. Measured on the same history the newer form is *shorter* (435 vs 469 chars) and says what the call was for. Non-array results keep the old truncation, and the JSON parse is guarded — this runs on every turn.
 - Reduction runs over a **copy** of the stored list. The strategies rewrite the list they are given; if that reached `chatSession.ChatHistory`, the `/ask` transcript would quietly start losing turns.
 - Compaction always runs over the full stored history, never over its own output, so it never compounds: turn 20 sees the same reduction of turns 1–10 that turn 11 saw.
-- Safe by construction, and verified: system message preserved, every user question and assistant answer preserved inside the window, and tool calls never separated from their results (the index groups an assistant call plus its results atomically).
+- Safe by construction, and verified: system message preserved, every user question and assistant answer preserved inside the window, and tool calls never separated from their results (the index groups an assistant call plus its results atomically). **Re-verified** by running the exact reducer configuration over synthetic histories: at 60 turns (241 stored messages) the output is 38 messages with `ChatRole.System` still at index 0. Nothing pins message 0 explicitly, so it *looks* droppable when you read the code — it isn't. Don't "fix" it without reproducing a loss first.
 
 ### Ratings default to IMDb
 
-IMDb-as-default is a deliberate product decision, and it is carried in three places that must agree — the system prompt's "Ratings" block, `ChatPlanner.GetMovieRating`'s `[Description]`, and the field names in the TMDb tool payloads. `DescribeMovie` used to return TMDb's vote average under the bare name `Rating`, which invited the model to answer "which had the highest rating?" straight from it; it is now `TmdbVoteAverage`.
+IMDb-as-default is a deliberate product decision, and it is carried in three places that must agree — the system prompt's "Ratings" block, `ChatPlanner.GetMovieRating`'s `[Description]`, and the field names in the TMDb tool payloads. `DescribeMovie` used to return TMDb's vote average under the bare name `Rating`, which invited the model to answer "which had the highest rating?" straight from it; it is now `TmdbVoteAverage`. `GetMovieDetails` kept emitting a bare `VoteAverage` for a while after that rename, which made the prompt's claim false for half the detail tools — it has since been renamed too and then unregistered entirely (see the tool list below).
+
+`DiscoverMovies` has a `sortBy` of `rating`, which orders by the **TMDb** vote average, not IMDb. Its `[Description]` says so and tells the model to still call `GetMovieRating` to answer a rating question. Sorting by rating also applies a 200-vote floor when the caller sets none, because TMDb ranks on raw average and would otherwise surface films with a single 10/10 vote.
 
 Measured on the same "Nolan sci-fi → which had the highest rating?" pair, six passes each: **3/6 answered from IMDb before these changes, 6/6 after.** The failure mode is pre-existing model non-determinism, not something the tool pruning introduced — confirm with a `git stash` A/B before concluding otherwise.
 
@@ -107,9 +116,35 @@ The `.Use(...)` is function-invocation middleware that caps the tool-calling loo
 
 There is no attribute-driven tool discovery any more. `Plugins.AddFromType<T>()` is replaced by explicit `CreateTools()` methods returning `IEnumerable<AITool>` built with `AIFunctionFactory.Create`, and `Program.cs` unions the three sources. **Adding a `[Description]`-annotated method without adding it to the matching `CreateTools()` leaves it invisible to the model** — this is the single easiest thing to get wrong.
 
-The model sees **23** tools. Four `ChatPlanner` methods are deliberately *not* offered, and the `CreateTools()` XML doc says why: `GenerateEnhancedFunnyFact` and `GenerateFunnyFact` (the app already runs the enhanced one out of band; as tools they cost two nested completions plus Wikipedia/Wikidata inside a call the model is waiting on, and the fact reaches the client through the response's own field), `GenerateRequiredSteps` (a fixed string restating a JSON shape the system prompt states and the strict schema enforces), and `GetMovieRatingGeneric` (same input and same lookup as `GetMovieRating`). The methods still exist and are still called — just not by the model. The seven date helpers were kept on purpose: their schemas are tiny and they exist precisely to stop the model inventing date ranges.
+The model sees **21** tools (8 TMDb + 7 date + 6 `ChatPlanner`). Every tool schema rides in the cached prompt prefix on every call, so the count is a permanent per-request cost.
 
-- `Prompts/TheMovieDBKernelFunctions.cs` — the main TMDb surface (genres, person search, movie search, discover with filters, movie details, trailers/videos).
+Not offered, on purpose:
+
+- `ChatPlanner.GenerateEnhancedFunnyFact` — still called, just out of band, racing the main model call. As a tool it cost a nested completion plus Wikipedia/Wikidata inside a call the model was waiting on, and the fact reaches the client through the response's own field.
+- `TheMovieDBKernelFunctions.GetMovieDetails` and `GetMovieWithTrailer` — the same `GetMovieAsync` lookup as `DescribeMovie` under different names, with overlapping-but-inconsistent field sets. `DescribeMovie` is the single detail tool and absorbed what they carried (genre ids as well as names, `TmdbVoteCount`, poster/backdrop). Kept in the file, just unregistered.
+- `HandleGenericTrailerRequest` — made no TMDb call at all; it ignored its argument and returned a fixed "which movie did you mean?" string.
+
+`GenerateFunnyFact`, `GenerateRequiredSteps` and `GetMovieRatingGeneric` were withheld at the migration and have since been **deleted** — nothing called them, and `GenerateRequiredSteps`'s worked example contained a fabricated `"MovieId": "1"` plus an `ImdbId` field the strict schema rejects, which `HandleTrailerRequest` was feeding the model as a fallback.
+
+The seven date helpers were kept on purpose: their schemas are tiny and they exist precisely to stop the model inventing date ranges.
+
+**Person questions need the right one of three filters, and getting it wrong fails silently.** TMDb files directing/writing/producing credits separately from acting credits, and originally only `with_cast` was wired up — so "sci-fi directed by Christopher Nolan" resolved him correctly to PersonId 525, filtered it as *cast*, and got **zero rows**. Measured: `with_cast=525` + genre 878 → 0 results; `with_cast=525` alone → documentaries *about* him; `with_crew=525` + genre 878 → Interstellar, Inception, The Prestige, Tenet. An empty result is exactly when the model stops calling functions and answers from memory, which is how "Nolan sci-fi" came back as *Harry Potter* and *Die Hard 2*. `DiscoverMovies` now also returns an explicit `Hint` instead of a bare `[]` when a cast filter matches nothing.
+
+`with_crew` alone is *not* "directed by" either — discover can filter by crew membership but **not by job**. Measured on Tarantino's 1990s crew results: alongside four directing credits it returns *True Romance* (Writer), *Natural Born Killers* (Story), *Killing Zoe* (Executive Producer) and *Jackie Chan: My Story*, where his only credit is **`Thanks`**. That is why `GetPersonMovieCredits` exists — one call returns every credit already carrying its `Job`, so it is both more accurate than discover-then-filter and cheaper. The rule the system prompt teaches:
+
+| Question | Tool |
+|---|---|
+| "what did X direct / write" | `GetPersonMovieCredits(personId, job: "Director")` |
+| "what has X been in" | `GetPersonMovieCredits(personId)` — no job filter |
+| person **combined with** genre/date/rating filters | `DiscoverMovies(castIds:)` or `(crewIds:)` |
+
+`GetPersonMovieCredits` sorts by popularity where it exists and falls back to release date. Only `MovieRole` (cast) carries `Popularity`; `MovieJob` (crew) does not. That split is deliberate: sorting acting credits by date makes "what has Meg Ryan been in?" lead with her most recent obscure work instead of *When Harry Met Sally*, while a job-filtered crew list is short and complete so newest-first is fine. Capped at `MaxPersonCredits` (25) with the withheld count stated in the payload rather than truncated silently.
+
+One thing that looks like a bug and is not: a person's credits can contain the same title twice with **different TMDb ids** — Tarantino has *Reservoir Dogs* as both `500` (1992 feature) and `443129` (1991 short), and *From Dusk Till Dawn* as `755` and `1623134`. Both are real upstream records. They are not deduplicated, because collapsing by title would silently drop a genuine credit.
+
+- `Prompts/TheMovieDBKernelFunctions.cs` — the main TMDb surface (genres, person search, movie search, discover with filters and sort, movie details, trailers/videos). Takes an **injected singleton `TMDbClient`**; `new TMDbClient(apiKey)` used to appear 14 times across the app (once per tool method, twice in `TrailerAgent`, twice per HTTP function), so nothing reused a connection and TMDb's API config was re-fetched per instance. The DI registration is also the one place a default language or region could go.
+
+  **No sequential per-result TMDb calls.** `SearchMovies` and `DiscoverMovies` need one `GetMovieExternalIdsAsync` per hit and TMDb has no batch endpoint, but running those in a `foreach` put up to 20 serial round trips inside one tool call. They now run concurrently behind a `SemaphoreSlim(8)`, writing by index so TMDb's ranking survives. Benchmarked on 20-result searches: 2182ms→208ms, 2375ms→148ms, 2218ms→106ms — **10–21×**, identical ids in identical order.
 - `Prompts/DateTimeKernelFunctions.cs` — relative-date helpers so the model can resolve "in the last 10 years" into ISO date ranges rather than hallucinating them. Static methods.
 - `Prompts/ChatPlanner.cs` — the façade over the `Agents/` classes (ratings, trailers, Wikipedia-backed "funny facts" and context). Now a normal scoped DI service; it used to be constructed by hand in `Chat-Ask` and bolted onto the kernel per request.
 
@@ -117,11 +152,17 @@ The class names still end in `KernelFunctions` for continuity with the file hist
 
 `Agents/` are plain DI services, never exposed to the model directly (`WikipediaSearchAgent` keeps `[Description]` attributes but is reached only through `ChatPlanner`):
 
-- `OpenMovieDbAgent` — OMDb ratings. IMDb rating is intentionally the primary/default rating everywhere; Rotten Tomatoes and Metacritic are secondary context only.
-- `WikipediaSearchAgent` — Wikipedia REST summary + Wikidata SPARQL, with a confidence score gating whether the enriched path or the basic path is used.
-- `TrailerAgent` — keyword-gated (`CanHandle`) flow: extract title via LLM → TMDb search → best official YouTube trailer → `[TRAILER]url[/TRAILER]`.
+- `OpenMovieDbAgent` — OMDb ratings. IMDb rating is intentionally the primary/default rating everywhere; Rotten Tomatoes and Metacritic are secondary context only. One OMDb response carries 38 fields and this agent used to read six; it now also surfaces `Awards`, `Plot`, `Director`, `Writer`, `Actors`, `Genre`, `Runtime`, `Rated` and `ImdbVotes`, which is where the "trivia and behind-the-scenes facts" the system prompt asks for actually come from. No extra HTTP — they were already in the body being parsed and discarded. `CompareMovieRatings`/`FilterMoviesByRating` stay lean (Awards only) because they are list-shaped.
+- `WikipediaSearchAgent` — Wikipedia REST summary + Wikidata SPARQL, with a confidence score gating whether the grounded path runs at all. **Four separate faults kept this from ever working in production; if facts stop appearing, check these first:**
+  1. **`User-Agent` is mandatory.** Wikimedia enforces its API etiquette — both `en.wikipedia.org/api/rest_v1` and `query.wikidata.org` return **403** without one, 200 with one. `AddHttpClient<T>()` sets none, so it is configured explicitly in `Program.cs`.
+  2. **Do not add `services.AddScoped<WikipediaSearchAgent>()`.** `AddHttpClient<T>` already registers `T`; a second descriptor shadows it (last registration wins) and the agent gets an unconfigured client.
+  3. **The summary DTO needs `[JsonPropertyName]`.** Wikipedia returns `"extract"`, System.Text.Json matches case-sensitively, and deserializing with no options bound `Extract` to null on every request. `PropertyNameCaseInsensitive = true` is *not* the fix — it makes `"pageid"` (a number) bind to a string property and throw, which `GetEnhancedInfo`'s catch swallows into the same silent null.
+  4. **No uncorrelated `COUNT` subqueries in the SPARQL.** The person queries had subqueries that did not project `?item`, so they counted globally over every film with any cast member; Wikidata answered 504 for "Tom Hanks". A timeout is indistinguishable from "no facts".
 
-**To add a new external data source:** add the class under `Agents/`, register it scoped in `Program.cs`, thread it through `ChatPlanner`'s constructor, add a `[Description]`-annotated wrapper method there, **and add that method to `ChatPlanner.CreateTools()`** — the last step is what actually exposes it to the model.
+  Confidence weights the Wikipedia summary at 0.6 so it clears the 0.5 gate alone — it is the only thing `GenerateEnhancedFunnyFact` interpolates, so requiring Wikidata to bind as well gated on data the prompt never reads. The fact prompt is told to use only the supplied summary and answer `NONE` otherwise; `NONE` becomes a null and the field is simply omitted. **There is deliberately no ungrounded fallback** — the previous one invented biography about real people and shipped it to the user verbatim. Measured hit rate on an identical query: 7 of 8.
+- `TrailerAgent` — keyword-gated (`CanHandle`) flow: extract title via LLM → TMDb search → best official YouTube trailer → `[TRAILER]url[/TRAILER]`. The gate needs a trailer noun, or a playback verb next to a video noun; it used to fire on bare `"show"`, `"watch"` and `"play"`, so "show me Tom Hanks movies" was routed into a trailer lookup.
+
+**To add a new external data source:** add the class under `Agents/`, register it scoped in `Program.cs`, thread it through `ChatPlanner`'s constructor, add a `[Description]`-annotated wrapper method there, **and add that method to `ChatPlanner.CreateTools()`** — the last step is what actually exposes it to the model. If it talks HTTP, use `AddHttpClient<T>` and set a `User-Agent`, and do **not** also register the type with `AddScoped<T>` (see the `WikipediaSearchAgent` notes above — that combination cost this app its entire enrichment path).
 
 ### Persistence
 

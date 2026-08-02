@@ -1,6 +1,7 @@
 ﻿using Microsoft.Extensions.Logging;
 using System.ComponentModel;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace MovieTracker.Backend.Agents
 {
@@ -26,7 +27,7 @@ namespace MovieTracker.Backend.Agents
         {
             try
             {
-                var wikipediaData = await SearchWikipedia(entityName, entityType);
+                var wikipediaData = await SearchWikipedia(entityName);
 
                 var wikidataInfo = await QueryWikidata(entityName, entityType);
 
@@ -45,9 +46,16 @@ namespace MovieTracker.Backend.Agents
             }
         }
 
-        private async Task<WikipediaContent?> SearchWikipedia(string entityName, string entityType)
+        /// <summary>
+        /// One request. It used to be seven: this summary fetch, a second fetch of
+        /// <c>/page/sections/{title}</c> whose response was assigned to a local and never read, and then
+        /// five fetches of <c>/page/sections/{title}/{section}</c>. That last path is not part of the
+        /// Wikipedia REST API - measured, it returns 404 every time - so the section text was always
+        /// empty, and its only effect was a confidence bonus that therefore never applied. Six round
+        /// trips per funny fact for nothing.
+        /// </summary>
+        private async Task<WikipediaContent?> SearchWikipedia(string entityName)
         {
-            // Search for the page
             var searchUrl = $"https://en.wikipedia.org/api/rest_v1/page/summary/{Uri.EscapeDataString(entityName)}";
             var response = await httpClient.GetAsync(searchUrl);
 
@@ -56,15 +64,10 @@ namespace MovieTracker.Backend.Agents
             var content = await response.Content.ReadAsStringAsync();
             var summary = JsonSerializer.Deserialize<WikipediaSummary>(content);
 
-            // Get full content for specific sections
-            var sectionsUrl = $"https://en.wikipedia.org/api/rest_v1/page/sections/{Uri.EscapeDataString(entityName)}";
-            var sectionsResponse = await httpClient.GetAsync(sectionsUrl);
-
             return new WikipediaContent
             {
                 Summary = summary?.Extract,
-                Thumbnail = summary?.Thumbnail?.Source,
-                Sections = await ExtractRelevantSections(entityName, entityType)
+                Thumbnail = summary?.Thumbnail?.Source
             };
         }
 
@@ -202,80 +205,6 @@ namespace MovieTracker.Backend.Agents
             }
         }
 
-        private async Task<Dictionary<string, string>?> ExtractRelevantSections(string entityName, string entityType)
-        {
-            try
-            {
-                var sectionsToExtract = entityType.ToLower() switch
-                {
-                    "movie" => new[] { "Plot", "Production", "Reception", "Legacy", "Box office" },
-                    "actor" => new[] { "Early life", "Career", "Personal life", "Filmography" },
-                    "director" => new[] { "Early life", "Career", "Style", "Filmography", "Awards" },
-                    _ => new[] { "Plot", "Production", "Reception" }
-                };
-
-                var sections = new Dictionary<string, string>();
-
-                foreach (var sectionName in sectionsToExtract)
-                {
-                    var sectionUrl = $"https://en.wikipedia.org/api/rest_v1/page/sections/{Uri.EscapeDataString(entityName)}/{Uri.EscapeDataString(sectionName)}";
-
-                    try
-                    {
-                        var response = await httpClient.GetAsync(sectionUrl);
-                        if (response.IsSuccessStatusCode)
-                        {
-                            var content = await response.Content.ReadAsStringAsync();
-                            var sectionData = JsonSerializer.Deserialize<WikipediaSection>(content);
-
-                            if (!string.IsNullOrEmpty(sectionData?.Text))
-                            {
-                                // Clean up the text (remove citations, excess whitespace)
-                                var cleanText = CleanWikipediaText(sectionData.Text);
-                                if (cleanText.Length > 50) // Only include substantial content
-                                {
-                                    sections[sectionName] = cleanText;
-                                }
-                            }
-                        }
-                    }
-                    catch
-                    {
-                        continue;
-                    }
-                }
-
-                return sections.Any() ? sections : null;
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        private string CleanWikipediaText(string text)
-        {
-            // Remove citation markers like [1], [2], etc.
-            text = System.Text.RegularExpressions.Regex.Replace(text, @"\[\d+\]", "");
-
-            // Remove excessive whitespace
-            text = System.Text.RegularExpressions.Regex.Replace(text, @"\s+", " ");
-
-            // Trim and limit length for chat context
-            text = text.Trim();
-            if (text.Length > 500)
-            {
-                text = text.Substring(0, 497) + "...";
-            }
-
-            return text;
-        }
-
-        public class WikipediaSection
-        {
-            public string? Text { get; set; }
-        }
-
         private string BuildMovieQuery(string movieTitle)
         {
             return $@"
@@ -290,22 +219,24 @@ namespace MovieTracker.Backend.Agents
                 LIMIT 10";
         }
 
+        // The COUNT subqueries these two used to carry did not project ?item, so SPARQL evaluated them
+        // uncorrelated - a global count over every film with any cast member, or any director, computed
+        // once per request. Wikidata answered with 504 Gateway Timeout: measured, "Tom Hanks" timed out
+        // every time while "Christopher Nolan" happened to squeak through. That timeout was
+        // indistinguishable from "this person has no facts", which is how a working lookup ended up
+        // scoring below the confidence gate. Birth date and birth place are the facts worth having and
+        // they are cheap; the counts are gone.
+
         private string BuildActorQuery(string actorName)
         {
             return $@"
-        SELECT DISTINCT ?item ?itemLabel ?birthDate ?birthPlace ?birthPlaceLabel ?occupation ?occupationLabel ?movies WHERE {{
+        SELECT DISTINCT ?item ?itemLabel ?birthDate ?birthPlace ?birthPlaceLabel ?occupation ?occupationLabel WHERE {{
           ?item wdt:P31 wd:Q5.
           ?item rdfs:label ""{actorName}""@en.
           ?item wdt:P106 ?occupation.
           FILTER(?occupation IN (wd:Q33999, wd:Q10800557, wd:Q2259451))
           OPTIONAL {{ ?item wdt:P569 ?birthDate. }}
           OPTIONAL {{ ?item wdt:P19 ?birthPlace. }}
-          OPTIONAL {{ 
-            SELECT (COUNT(?movie) as ?movies) WHERE {{
-              ?movie wdt:P31 wd:Q11424.
-              ?movie wdt:P161 ?item.
-            }}
-          }}
           SERVICE wikibase:label {{ bd:serviceParam wikibase:language ""en"". }}
         }}
         LIMIT 10";
@@ -314,34 +245,38 @@ namespace MovieTracker.Backend.Agents
         private string BuildDirectorQuery(string directorName)
         {
             return $@"
-        SELECT DISTINCT ?item ?itemLabel ?birthDate ?birthPlace ?birthPlaceLabel ?movies ?awards WHERE {{
+        SELECT DISTINCT ?item ?itemLabel ?birthDate ?birthPlace ?birthPlaceLabel WHERE {{
           ?item wdt:P31 wd:Q5.
           ?item rdfs:label ""{directorName}""@en.
           ?item wdt:P106 wd:Q2526255.
           OPTIONAL {{ ?item wdt:P569 ?birthDate. }}
           OPTIONAL {{ ?item wdt:P19 ?birthPlace. }}
-          OPTIONAL {{ 
-            SELECT (COUNT(?movie) as ?movies) WHERE {{
-              ?movie wdt:P31 wd:Q11424.
-              ?movie wdt:P57 ?item.
-            }}
-          }}
-          OPTIONAL {{ 
-            SELECT (COUNT(?award) as ?awards) WHERE {{
-              ?item wdt:P166 ?award.
-            }}
-          }}
           SERVICE wikibase:label {{ bd:serviceParam wikibase:language ""en"". }}
         }}
         LIMIT 10";
         }
 
+        /// <summary>
+        /// Scores how much grounding is available, against a &gt; 0.5 gate in ChatPlanner.
+        /// <para>
+        /// The Wikipedia summary is weighted to clear that gate on its own, because it is the only thing
+        /// the callers actually generate from - GenerateEnhancedFunnyFact interpolates
+        /// <c>WikipediaContent.Summary</c> and nothing else. The old weights made a substantial summary
+        /// worth 0.4 and required Wikidata to bind as well, so a perfectly groundable entity was rejected
+        /// whenever the SPARQL endpoint was slow or the labels did not match exactly. That is gating on
+        /// data the prompt never reads. Wikidata facts still add confidence and still reach
+        /// GetChatContext and GetMovieContext, which do use them.
+        /// </para>
+        /// <para>
+        /// The section bonus is gone with the sections themselves - that endpoint always 404'd, so the
+        /// term was dead weight.
+        /// </para>
+        /// </summary>
         private double CalculateConfidence(WikipediaContent? wikipedia, WikidataInfo? wikidata)
         {
             var score = 0.0;
-            if (wikipedia?.Summary?.Length > 100) score += 0.4;
+            if (wikipedia?.Summary?.Length > 100) score += 0.6;
             if (wikidata?.StructuredFacts?.Any() == true) score += 0.4;
-            if (wikipedia?.Sections?.Any() == true) score += 0.2;
             return Math.Min(score, 1.0);
         }
     }
@@ -358,7 +293,6 @@ namespace MovieTracker.Backend.Agents
     {
         public string? Summary { get; set; }
         public string? Thumbnail { get; set; }
-        public Dictionary<string, string>? Sections { get; set; }
     }
 
     public class WikidataInfo
@@ -367,18 +301,43 @@ namespace MovieTracker.Backend.Agents
         public List<string>? RelatedEntities { get; set; }
     }
 
+    /// <summary>
+    /// Wikipedia's REST summary payload.
+    /// <para>
+    /// The <see cref="JsonPropertyNameAttribute"/>s are load-bearing, not tidiness. Wikipedia returns
+    /// lowercase keys ("extract", "thumbnail"), System.Text.Json matches case-sensitively by default,
+    /// and <c>SearchWikipedia</c> deserialized with no options at all - so <c>Extract</c> bound to
+    /// nothing and came back null on every request the app has ever made. That put the confidence score
+    /// permanently below ChatPlanner's 0.5 gate, which is what sent every funny fact to the ungrounded
+    /// fallback. Measured: null as shipped, 485 chars with these attributes.
+    /// </para>
+    /// <para>
+    /// Reaching for <c>PropertyNameCaseInsensitive = true</c> instead does not work - it makes
+    /// "pageid", a JSON number, bind to a string property and throw, and GetEnhancedInfo's catch
+    /// swallows that into the same silent null. The offending property was unread, so it is gone.
+    /// </para>
+    /// </summary>
     public class WikipediaSummary
     {
+        [JsonPropertyName("title")]
         public string? Title { get; set; }
+
+        [JsonPropertyName("extract")]
         public string? Extract { get; set; }
+
+        [JsonPropertyName("thumbnail")]
         public WikipediaThumbnail? Thumbnail { get; set; }
-        public string? PageId { get; set; }
     }
 
     public class WikipediaThumbnail
     {
+        [JsonPropertyName("source")]
         public string? Source { get; set; }
+
+        [JsonPropertyName("width")]
         public int Width { get; set; }
+
+        [JsonPropertyName("height")]
         public int Height { get; set; }
     }
 

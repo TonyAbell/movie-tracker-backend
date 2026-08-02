@@ -12,6 +12,7 @@ using System.Text.Json.Serialization;
 using System.Text.Json;
 using Microsoft.Extensions.Caching.Distributed;
 using TMDbLib.Client;
+using TMDbLib.Objects.Movies;
 using Microsoft.Extensions.Configuration;
 using MovieTracker.Backend.Prompts;
 using MovieTracker.Backend.Agents;
@@ -45,6 +46,17 @@ namespace MovieTracker.Backend.Functions
     //    favorite: boolean;
     //}
 
+    /// <summary>
+    /// The hydrated shape the frontend consumes.
+    /// <para>
+    /// The last three are additive and nullable on purpose. HydratedMovies rides along in the session's
+    /// Cosmos document, so documents written before these fields existed deserialize them as null -
+    /// clients must treat a null GenreNames as "unknown", not as an empty list. All three come off the
+    /// same Movie object hydration already fetches, so none of them costs a request: GenreNames because
+    /// the frontend was being handed GenreIds with no genre map to resolve them against, Runtime and
+    /// Tagline because they were being parsed and dropped.
+    /// </para>
+    /// </summary>
     public record MovieViewModel(
         string PosterPath,
         bool Adult,
@@ -62,13 +74,12 @@ namespace MovieTracker.Backend.Functions
         double VoteAverage,
         bool Favorite,
         string ImdbId,
-        MovieTrailerInfo? Trailer
+        MovieTrailerInfo? Trailer,
+        List<string>? GenreNames = null,
+        int? Runtime = null,
+        string? Tagline = null
     );
-    public record MovieItem(string MovieId, string MovieName);
-    public record LLMResponse(string SystemMessage, List<MovieItem> MovieList);
-    
 
-    //public record ChatMessageRecord(string Role, string Text);
 
     [JsonPolymorphic(TypeDiscriminatorPropertyName = nameof(role))]
     [JsonDerivedType(typeof(UserChatMessage), typeDiscriminator: "user")]
@@ -134,11 +145,17 @@ namespace MovieTracker.Backend.Functions
     }
 
 
+    // The structured-output schema, and therefore the exact shape every turn must come back in.
+    //
+    // This deliberately carries no FunnyFact. It used to, and RequireAllProperties below made it
+    // mandatory, so the model paid output tokens to write one on every single turn - while
+    // ToClientMessageAsync read only SystemMessage and MovieList, and the fact the client actually
+    // receives comes from chatSession.FunnyFact, produced out of band by ChatPlanner. The field was
+    // write-only: never read, and free to contradict the real one.
     public class MovieListResponse
     {
         public string SystemMessage { get; set; }
         public List<MovieListItem> MovieList { get; set; }
-        public string FunnyFact { get; set; }
     }
 
     public class MovieListItem 
@@ -147,9 +164,8 @@ namespace MovieTracker.Backend.Functions
         public string MovieName { get; set; }
     }
 
-    public class Function(AIAgent agent, ChatPlanner chatPlanner, ChatSessionRepository chatSessionRepository, IDistributedCache cache, IConfiguration configuration, ILogger<Function> logger, Tracer tracer)
+    public class Function(AIAgent agent, ChatPlanner chatPlanner, ChatSessionRepository chatSessionRepository, IDistributedCache cache, TMDbClient tmdbClient, IConfiguration configuration, ILogger<Function> logger, Tracer tracer)
     {
-        private readonly string apiKey = configuration["TheMovieDb:Api-Key"] ?? throw new ArgumentNullException("Missing The Movice Db Api Key");
 
         // The model must answer with MovieListResponse's exact PascalCase property names: the system
         // prompt names "SystemMessage"/"MovieList" and ProcessMovieAsync reads "MovieId" back out.
@@ -227,6 +243,12 @@ namespace MovieTracker.Backend.Functions
         // of what came back, not enough to pay for it twice.
         private const int CollapsedToolResultChars = 160;
 
+        // Enough to keep an id list or a date readable without letting one long argument dominate.
+        private const int CollapsedArgumentChars = 60;
+
+        // How many result names to name outright before falling back to "+N more".
+        private const int CollapsedResultNames = 6;
+
         // AsChatReducer is the supported way to drive a CompactionStrategy over a plain message list -
         // CompactionMessageIndex, which the strategies actually operate on, is not public. Each
         // ReduceAsync builds its own index from the messages handed in and returns the included ones.
@@ -265,12 +287,92 @@ namespace MovieTracker.Backend.Functions
             {
                 var text = results.TryGetValue(call.CallId, out var result) ? result : string.Empty;
 
-                lines.Add(text.Length <= CollapsedToolResultChars
-                    ? $"{call.Name}: {text}"
-                    : $"{call.Name}: {text[..CollapsedToolResultChars]}... [{text.Length - CollapsedToolResultChars} more chars elided]");
+                lines.Add($"{call.Name}({SummariseArguments(call.Arguments)}) -> {SummariseResult(text)}");
             }
 
             return string.Join("\n", lines);
+        }
+
+        // The arguments were dropped entirely, which made these lines far weaker than their length
+        // suggested: a later turn could see that DiscoverMovies had been called twice but not that one
+        // was a cast filter and the other a genre filter. They are short and they are the part that
+        // says what the call was actually for.
+        private static string SummariseArguments(IDictionary<string, object?>? arguments)
+        {
+            if (arguments is null || arguments.Count == 0) return string.Empty;
+
+            return string.Join(", ", arguments
+                .Where(argument => argument.Value is not null)
+                .Select(argument =>
+                {
+                    var value = argument.Value!.ToString() ?? string.Empty;
+                    if (value.Length > CollapsedArgumentChars)
+                    {
+                        value = value[..CollapsedArgumentChars] + "...";
+                    }
+                    return $"{argument.Key}={value}";
+                }));
+        }
+
+        // A raw 160-char prefix of a twenty-movie JSON array is about one and a half objects: the model
+        // sees "[{\"MovieId\":\"27205\",\"MovieName\":\"Inception\",\"ReleaseDate\":\"2010-07-15\"..." and
+        // learns almost nothing. What is actually worth carrying forward is how many results came back
+        // and what they were called, so array results are reduced to a count and the leading names. The
+        // raw truncation stays as the fallback for anything that is not a recognisable array of objects.
+        private static string SummariseResult(string text)
+        {
+            if (text.Length == 0) return "(no result)";
+
+            try
+            {
+                if (text.TrimStart().StartsWith('['))
+                {
+                    using var document = JsonDocument.Parse(text);
+                    if (document.RootElement.ValueKind == JsonValueKind.Array)
+                    {
+                        var names = document.RootElement.EnumerateArray()
+                            .Where(element => element.ValueKind == JsonValueKind.Object)
+                            .Select(NameOf)
+                            .Where(name => name is not null)
+                            .ToList();
+
+                        var total = document.RootElement.GetArrayLength();
+                        var label = total == 1 ? "result" : "results";
+                        if (total == 0) return "0 results";
+
+                        if (names.Count > 0)
+                        {
+                            var shown = string.Join(", ", names.Take(CollapsedResultNames));
+                            var more = names.Count > CollapsedResultNames ? $", +{names.Count - CollapsedResultNames} more" : string.Empty;
+                            return $"{total} {label}: {shown}{more}";
+                        }
+
+                        return $"{total} {label}";
+                    }
+                }
+            }
+            catch (JsonException)
+            {
+                // Not JSON, or not the shape assumed - fall through to the raw prefix. This runs on every
+                // turn, so it must never be the thing that fails one.
+            }
+
+            return text.Length <= CollapsedToolResultChars
+                ? text
+                : $"{text[..CollapsedToolResultChars]}... [{text.Length - CollapsedToolResultChars} more chars elided]";
+        }
+
+        private static string? NameOf(JsonElement element)
+        {
+            foreach (var property in (string[])["MovieName", "Title", "PersonName", "Name", "GenreName"])
+            {
+                if (element.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String)
+                {
+                    return value.GetString();
+                }
+            }
+
+            return null;
         }
 #pragma warning restore MAAI001
 
@@ -301,9 +403,24 @@ namespace MovieTracker.Backend.Functions
                     - NEVER invent a MovieId. Every MovieId you return must be the numeric TMDb id that a
                       function actually returned to you (for example "13", not "1990-Forrest-Gump").
                     - Typical flow: SearchForPeople to resolve a person to a PersonId, then DiscoverMovies
-                      with that cast id and any date/genre filters; or SearchMovies when the user names a title.
+                      with that id and any date/genre filters; or SearchMovies when the user names a title.
+                    - "Directed by" / "written by" / "what has X been in": call GetPersonMovieCredits with
+                      the PersonId, and pass job="Director" for directing. It is the only tool that knows
+                      which job someone did on a film - a plain crew filter also matches writing,
+                      producing, even a "Thanks" credit, and cast filters miss directors entirely.
+                    - Use DiscoverMovies castIds/crewIds when you need to combine a person with other
+                      filters (genre, dates, rating); use GetPersonMovieCredits when the question is
+                      about one person's own work.
+                    - When the user asks for the "best", "top", "most popular", "highest grossing" or
+                      "newest" of something, pass DiscoverMovies a sortBy value rather than sorting the
+                      results yourself. Use genreMatch "any" for "X or Y" and leave it out for "X and Y".
                     - Populate MovieList with every relevant movie you found. Return an empty MovieList only
                       when the functions genuinely came back with no matches.
+                    - Order MovieList deliberately - best or most relevant first, and in the same order you
+                      discuss them in SystemMessage. That order is preserved all the way to the user.
+                    - MovieIds, PersonIds, genre ids and IMDb ids are plumbing. Use them in function calls
+                      and put them in MovieList, but never mention one in SystemMessage - the user reads
+                      that text and "Christopher Nolan (TMDb PersonId 525)" means nothing to them.
 
                     **Ratings - IMDb is the default:**
                     - When the user asks about a "rating", "score", or which film was "highest rated"
@@ -365,16 +482,16 @@ namespace MovieTracker.Backend.Functions
         }
 
         // These run under Task.WhenAll, so one unresolvable movie would otherwise fail the
-        // entire response. Hydration of a single entry is best-effort.
+        // entire response. Hydration of a single entry is best-effort: its slot just stays null.
         private async Task SafeProcessMovieAsync(
             JsonElement movie,
-            List<MovieViewModel> movieItems,
-            TMDbClient client,
+            MovieViewModel?[] slots,
+            int index,
             ConcurrentDictionary<string, MovieViewModel> sessionCache)
         {
             try
             {
-                await ProcessMovieAsync(movie, movieItems, client, sessionCache);
+                await ProcessMovieAsync(movie, slots, index, sessionCache);
             }
             catch (Exception ex)
             {
@@ -382,10 +499,14 @@ namespace MovieTracker.Backend.Functions
             }
         }
 
+        // Writes into a pre-sized array by index rather than appending to a shared list under a lock.
+        // These tasks all run concurrently, so appending produced *completion* order - the model would
+        // answer "here they are, best first" and the frontend would render them in whatever order TMDb
+        // happened to respond. Indexing keeps the model's ordering and drops the lock.
         private async Task ProcessMovieAsync(
             JsonElement movie,
-            List<MovieViewModel> movieItems,
-            TMDbClient client,
+            MovieViewModel?[] slots,
+            int index,
             ConcurrentDictionary<string, MovieViewModel> sessionCache)
         {
             if (!movie.TryGetProperty("MovieId", out var movieIdElement))
@@ -411,10 +532,7 @@ namespace MovieTracker.Backend.Functions
             // here, which is what makes hydration cost O(this turn) rather than O(conversation).
             if (sessionCache.TryGetValue(movieId, out var cachedForSession))
             {
-                lock (movieItems)
-                {
-                    movieItems.Add(cachedForSession);
-                }
+                slots[index] = cachedForSession;
                 return;
             }
 
@@ -427,22 +545,21 @@ namespace MovieTracker.Backend.Functions
                 if (movieViewModel != null)
                 {
                     sessionCache[movieId] = movieViewModel;
-                    lock (movieItems) // Thread-safe access to shared list
-                    {
-                        movieItems.Add(movieViewModel);
-                    }
+                    slots[index] = movieViewModel;
                 }
             }
             else
             {
-                var tmdbMovie = await client.GetMovieAsync(tmdbMovieId);
+                // Details and videos in a single request. This is the hottest TMDb path in the app - it
+                // runs once per movie per cache miss, and every movie of a fresh answer is a miss - so
+                // folding the videos call in with append_to_response halves cold-hydration traffic.
+                var tmdbMovie = await tmdbClient.GetMovieAsync(tmdbMovieId, MovieMethods.Videos);
                 var imdbId = tmdbMovie.ImdbId ?? "";
 
                 MovieTrailerInfo? trailerInfo = null;
                 try
                 {
-                    var videos = await client.GetMovieVideosAsync(tmdbMovieId);
-                    var trailer = videos.Results
+                    var trailer = tmdbMovie.Videos?.Results
                         .Where(v => v.Type == "Trailer" && v.Site == "YouTube")
                         .OrderByDescending(v => v.Official)
                         .ThenByDescending(v => v.Size)
@@ -473,15 +590,14 @@ namespace MovieTracker.Backend.Functions
                     tmdbMovie.VoteAverage,
                     Favorite: false,
                     imdbId,
-                    trailerInfo
+                    trailerInfo,
+                    GenreNames: tmdbMovie.Genres.Select(g => g.Name).ToList(),
+                    Runtime: tmdbMovie.Runtime,
+                    Tagline: tmdbMovie.Tagline
                 );
 
                 sessionCache[movieId] = movieViewModel;
-
-                lock (movieItems) // Thread-safe access to shared list
-                {
-                    movieItems.Add(movieViewModel);
-                }
+                slots[index] = movieViewModel;
 
                 var movieViewModelBytes = JsonSerializer.SerializeToUtf8Bytes(movieViewModel);
                 await cache.SetAsync(movieId, movieViewModelBytes);
@@ -493,7 +609,6 @@ namespace MovieTracker.Backend.Functions
         // the intermediate function-call / function-result messages, which have no text.
         private async Task<ChatMessage?> ToClientMessageAsync(
             AIChatMessage message,
-            TMDbClient client,
             ConcurrentDictionary<string, MovieViewModel> sessionCache)
         {
             var text = message.Text;
@@ -513,7 +628,7 @@ namespace MovieTracker.Backend.Functions
             }
 
             text = text.Replace("```json", "").Replace("```", "");
-            List<MovieViewModel> movieItems = new List<MovieViewModel>();
+            List<MovieViewModel> movieItems = [];
 
             try
             {
@@ -523,13 +638,15 @@ namespace MovieTracker.Backend.Functions
 
                 if (root.TryGetProperty("MovieList", out JsonElement movieList))
                 {
-                    var tasks = new List<Task>();
-                    foreach (var movie in movieList.EnumerateArray())
-                    {
-                        tasks.Add(SafeProcessMovieAsync(movie, movieItems, client, sessionCache));
-                    }
+                    var entries = movieList.EnumerateArray().ToList();
+                    var slots = new MovieViewModel?[entries.Count];
 
-                    await Task.WhenAll(tasks);
+                    await Task.WhenAll(entries.Select((movie, index) =>
+                        SafeProcessMovieAsync(movie, slots, index, sessionCache)));
+
+                    // Compact out the entries that could not be hydrated - a bad id, or a TMDb failure -
+                    // while keeping the order the model chose for the rest.
+                    movieItems = [.. slots.Where(slot => slot is not null).Select(slot => slot!)];
                 }
 
                 return new AssistantChatMessage(systemMessage, movieItems);
@@ -714,7 +831,6 @@ namespace MovieTracker.Backend.Functions
             using var activity = tracer.StartActiveSpan("movie-tracker-func.chat-ask");
             try
             {
-                TMDbClient client = new TMDbClient(apiKey);
                 var ask = await req.ReadFromJsonAsync<Ask>();
                 if (ask == null)
                 {
@@ -737,7 +853,7 @@ namespace MovieTracker.Backend.Functions
                 var responseMessages = new List<ChatMessage>();
                 foreach (var message in chatSession.ChatHistory)
                 {
-                    var clientMessage = await ToClientMessageAsync(message, client, sessionCache);
+                    var clientMessage = await ToClientMessageAsync(message, sessionCache);
                     if (clientMessage != null)
                     {
                         responseMessages.Add(clientMessage);
@@ -767,7 +883,6 @@ namespace MovieTracker.Backend.Functions
             using var activity = tracer.StartActiveSpan("movie-tracker-func.chat-ask-v2");
             try
             {
-                TMDbClient client = new TMDbClient(apiKey);
                 var ask = await req.ReadFromJsonAsync<Ask>();
                 if (ask == null)
                 {
@@ -786,7 +901,7 @@ namespace MovieTracker.Backend.Functions
 
                 ChatMessage turn = newAssistantMessage == null
                     ? new AssistantChatMessage("No movies were found", [])
-                    : await ToClientMessageAsync(newAssistantMessage, client, sessionCache)
+                    : await ToClientMessageAsync(newAssistantMessage, sessionCache)
                       ?? new AssistantChatMessage("No movies were found", []);
 
                 await SaveSessionAsync(chatSession, sessionCache);

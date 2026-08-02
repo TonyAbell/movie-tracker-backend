@@ -16,6 +16,17 @@ namespace MovieTracker.Backend.Agents
         string ThumbnailUrl   // Constructed: https://img.youtube.com/vi/{Key}/maxresdefault.jpg
     );
 
+    /// <summary>
+    /// What survives from an OMDb lookup.
+    /// <para>
+    /// The fields below <see cref="BoxOffice"/> were being deserialized and thrown away on every
+    /// single rating call. OMDb returns 38 properties; this agent read six. Meanwhile the system
+    /// prompt asks the model for "interesting trivia", "cultural impact" and "behind-the-scenes
+    /// facts" - and Awards ("Won 4 Oscars. 159 wins &amp; 220 nominations total") was sitting in the
+    /// response body, already paid for, already parsed, and dropped on the floor. Surfacing them
+    /// costs no extra HTTP.
+    /// </para>
+    /// </summary>
     public record MovieRatingResult(
         string Title,
         string Year,
@@ -25,7 +36,16 @@ namespace MovieTracker.Backend.Agents
         string BoxOffice,
         bool IsSuccess,
         string ErrorMessage = "",
-        MovieTrailerInfo? Trailer = null
+        MovieTrailerInfo? Trailer = null,
+        string Rated = "",
+        string Runtime = "",
+        string Genre = "",
+        string Director = "",
+        string Writer = "",
+        string Actors = "",
+        string Awards = "",
+        string Plot = "",
+        string ImdbVotes = ""
     );
 
     public record RatingComparisonResult(
@@ -67,7 +87,16 @@ namespace MovieTracker.Backend.Agents
                     RottenTomatoesRating: GetRatingBySource(ratings, "Rotten Tomatoes"),
                     MetacriticRating: GetRatingBySource(ratings, "Metacritic"),
                     BoxOffice: movie.BoxOffice ?? "N/A",
-                    IsSuccess: true
+                    IsSuccess: true,
+                    Rated: movie.Rated ?? "",
+                    Runtime: movie.Runtime ?? "",
+                    Genre: movie.Genre ?? "",
+                    Director: movie.Director ?? "",
+                    Writer: movie.Writer ?? "",
+                    Actors: movie.Actors ?? "",
+                    Awards: movie.Awards ?? "",
+                    Plot: movie.Plot ?? "",
+                    ImdbVotes: movie.ImdbVotes ?? ""
                 );
             }
             catch (Exception ex)
@@ -76,20 +105,23 @@ namespace MovieTracker.Backend.Agents
             }
         }
 
+        /// <summary>
+        /// One OMDb round trip per id, run concurrently. These used to be awaited one at a time inside
+        /// a foreach, so comparing five films meant five serial round trips inside a tool call the model
+        /// was blocked on. Order is preserved because Task.WhenAll returns results positionally.
+        /// </summary>
+        private static async Task<List<MovieRatingResult>> GetManyAsync(
+            List<string> imdbIds,
+            Func<string, Task<MovieRatingResult>> lookup) =>
+            [.. await Task.WhenAll(imdbIds.Select(lookup))];
+
         public async Task<RatingComparisonResult> CompareMovieRatings(List<string> imdbIds)
         {
             try
             {
-                var movieRatings = new List<MovieRatingResult>();
-
-                foreach (var id in imdbIds)
-                {
-                    var rating = await GetMovieRatings(id);
-                    if (rating.IsSuccess)
-                    {
-                        movieRatings.Add(rating);
-                    }
-                }
+                var movieRatings = (await GetManyAsync(imdbIds, GetMovieRatings))
+                    .Where(rating => rating.IsSuccess)
+                    .ToList();
 
                 if (!movieRatings.Any())
                 {
@@ -121,20 +153,12 @@ namespace MovieTracker.Backend.Agents
 
         public async Task<List<MovieRatingResult>> FilterMoviesByRating(List<string> imdbIds, double minimumRating)
         {
-            var qualifyingMovies = new List<MovieRatingResult>();
+            var ratings = await GetManyAsync(imdbIds, GetMovieRatings);
 
-            foreach (var id in imdbIds)
-            {
-                var rating = await GetMovieRatings(id);
-                if (rating.IsSuccess &&
-                    double.TryParse(rating.ImdbRating, NumberStyles.Any, CultureInfo.InvariantCulture, out double actualRating) &&
-                    actualRating >= minimumRating)
-                {
-                    qualifyingMovies.Add(rating);
-                }
-            }
-
-            return qualifyingMovies;
+            return [.. ratings.Where(rating =>
+                rating.IsSuccess
+                && double.TryParse(rating.ImdbRating, NumberStyles.Any, CultureInfo.InvariantCulture, out double actualRating)
+                && actualRating >= minimumRating)];
         }
 
         private static string GetRatingBySource(List<Rating> ratings, string sourceName)

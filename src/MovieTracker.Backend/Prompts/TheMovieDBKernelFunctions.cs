@@ -8,7 +8,12 @@ using TMDbLib.Objects.Discover;
 
 namespace MovieTracker.Backend.Prompts
 {
-    public record MovieSearchResult(string MovieId, string MovieName, string ReleaseDate, string ImdbId);
+    public record MovieSearchResult(
+        string MovieId,
+        string MovieName,
+        string ReleaseDate,
+        string ImdbId,
+        int? RuntimeMinutes = null);
     public record GenresItem(string GenreId, string GenreName);
 
     public class TheMovieDBKernelFunctions(TMDbClient client)
@@ -25,6 +30,20 @@ namespace MovieTracker.Backend.Prompts
         /// the call. The payload says how many were withheld rather than truncating silently.
         /// </summary>
         private const int MaxPersonCredits = 25;
+
+        /// <summary>
+        /// How many credits to look up genres for when a genre filter is supplied. The filter has to run
+        /// before the cap - filtering the top 25 by popularity would miss a qualifying film that sits at
+        /// 30 - so the candidate pool is widened first. Only paid when genreIds is actually passed, and
+        /// still bounded: a director's whole filmography fits comfortably inside this.
+        /// </summary>
+        private const int MaxGenreFilterLookups = 60;
+
+        /// <summary>
+        /// TMDb keys content ratings by country and there is no global one. US is hardcoded to match the
+        /// rest of the app, which already assumes an English-language, US-centric catalogue.
+        /// </summary>
+        private const string CertificationCountry = "US";
 
         /// <summary>
         /// Resolves TMDb movie ids to IMDb ids, concurrently, bounded by
@@ -64,6 +83,56 @@ namespace MovieTracker.Backend.Prompts
             }));
 
             return new Dictionary<int, string>(resolved);
+        }
+
+        /// <summary>What a per-movie detail lookup contributes beyond the credit itself.</summary>
+        private sealed record MovieFacts(
+            string ImdbId,
+            IReadOnlyList<int> GenreIds,
+            IReadOnlyList<string> GenreNames,
+            int? Runtime);
+
+        /// <summary>
+        /// Like <see cref="ResolveImdbIdsAsync"/> but fetches the whole movie, because TMDb's person
+        /// credits carry no genre at all on crew entries - <c>MovieJob</c> has Title, Job and dates and
+        /// nothing else, so "sci-fi films X directed" cannot be answered from the credits list alone.
+        /// <para>
+        /// This is the same <i>number</i> of round trips as resolving external ids: one per movie either
+        /// way, bounded by <see cref="MaxConcurrentTmdbCalls"/>. GetMovieAsync just returns more from
+        /// each of them, including the ImdbId that lookup existed for. The lighter external-ids path is
+        /// kept for search and discover, which need no genres.
+        /// </para>
+        /// </summary>
+        private async Task<Dictionary<int, MovieFacts>> ResolveMovieFactsAsync(IEnumerable<int> movieIds)
+        {
+            var resolved = new ConcurrentDictionary<int, MovieFacts>();
+            using var throttle = new SemaphoreSlim(MaxConcurrentTmdbCalls);
+
+            await Task.WhenAll(movieIds.Distinct().Select(async movieId =>
+            {
+                await throttle.WaitAsync();
+                try
+                {
+                    var movie = await client.GetMovieAsync(movieId);
+                    resolved[movieId] = new MovieFacts(
+                        movie.ImdbId ?? "",
+                        [.. movie.Genres?.Select(genre => genre.Id) ?? []],
+                        [.. movie.Genres?.Select(genre => genre.Name).Where(name => name is not null) ?? []],
+                        movie.Runtime);
+                }
+                catch
+                {
+                    // A movie we cannot describe still belongs in the list under its own title; it just
+                    // cannot participate in genre filtering.
+                    resolved[movieId] = new MovieFacts("", [], [], null);
+                }
+                finally
+                {
+                    throttle.Release();
+                }
+            }));
+
+            return new Dictionary<int, MovieFacts>(resolved);
         }
 
         /// <summary>
@@ -202,14 +271,24 @@ namespace MovieTracker.Backend.Prompts
                      "each film. This is the right tool for 'what did X direct', 'what did X write' and " +
                      "'what has X been in', because it is the only one that can tell a directing credit " +
                      "from a writing or producing one - pass job='Director' for 'directed by'. Prefer " +
-                     "this over DiscoverMovies(crewIds:) for any question about one person's own work.")]
-        [return: Description("JSON with the person's credits: MovieId, MovieName, ReleaseDate, ImdbId, and either Character (acting) or Job")]
+                     "this over DiscoverMovies(crewIds:) for any question about one person's own work. " +
+                     "For 'sci-fi films X directed', pass genreIds as well and let this filter them; the " +
+                     "returned credits also carry Genres so you can narrow further yourself.")]
+        [return: Description("JSON with the person's credits: MovieId, MovieName, ReleaseDate, ImdbId, Genres, and either Character (acting) or Job")]
         public async Task<string> GetPersonMovieCredits(
             [Description("The TMDb PersonId, as returned by SearchForPeople")] string personId,
-            [Description("Optional: keep only credits with this exact job, e.g. 'Director', 'Screenplay', " +
-                         "'Producer'. Use 'Director' for 'directed by'. Omit for acting roles plus all crew work.")] string? job = null,
+            [Description("Optional: keep only credits of this kind. 'Director' for 'directed by', " +
+                         "'Writer' for 'wrote', 'Producer' for 'produced', 'Actor' for 'starred in'. " +
+                         "Omit for acting roles plus all crew work.")] string? job = null,
             [Description("Optional: only films released in or after this year (YYYY)")] string? fromYear = null,
-            [Description("Optional: only films released in or before this year (YYYY)")] string? toYear = null)
+            [Description("Optional: only films released in or before this year (YYYY)")] string? toYear = null,
+            [Description("Optional: keep only films in these genres, as comma-separated genre ids from " +
+                         "GetGenresList. Use this for 'sci-fi films X directed' rather than filtering the " +
+                         "results yourself - a person's credits do not otherwise carry genres.")] string? genreIds = null,
+            [Description("Optional: how to order the credits. 'popularity' (default, best known first), " +
+                         "'longest' or 'shortest' by runtime, 'newest' or 'oldest' by release date. For " +
+                         "'the longest film X directed' pass 'longest' and take the first result - do not " +
+                         "ask for the default order and compare the runtimes yourself.")] string? sortBy = null)
         {
             if (!TryGetPersonId(personId, out var tmdbPersonId, out var idError)) return idError;
 
@@ -218,9 +297,17 @@ namespace MovieTracker.Backend.Prompts
             var wantJob = job?.Trim();
             var filterByJob = !string.IsNullOrEmpty(wantJob);
 
-            // Acting credits are only relevant when no crew job was asked for - "what did Nolan direct"
-            // should not come back with his cameos.
-            var acting = filterByJob
+            var (jobKind, jobNames) = filterByJob
+                ? ResolveJobFilter(wantJob!)
+                : (CreditKind.Crew, []);
+
+            // Acting credits are excluded when a *crew* job was asked for - "what did Nolan direct"
+            // should not come back with his cameos - but they are the whole answer when the job asked
+            // for is an acting one.
+            var includeCast = !filterByJob || jobKind == CreditKind.Cast;
+            var includeCrew = !filterByJob || jobKind == CreditKind.Crew;
+
+            var acting = !includeCast
                 ? []
                 : (credits.Cast ?? []).Select(role => new
                 {
@@ -232,8 +319,9 @@ namespace MovieTracker.Backend.Prompts
                     Popularity = (double?)role.Popularity,
                 }).ToList();
 
-            var working = (credits.Crew ?? [])
-                .Where(crew => !filterByJob || string.Equals(crew.Job, wantJob, StringComparison.OrdinalIgnoreCase))
+            var working = (!includeCrew ? [] : (credits.Crew ?? []))
+                .Where(crew => !filterByJob
+                    || jobNames.Contains(crew.Job ?? string.Empty, StringComparer.OrdinalIgnoreCase))
                 .Select(crew => new
                 {
                     MovieId = crew.Id.ToString(),
@@ -266,9 +354,20 @@ namespace MovieTracker.Backend.Prompts
                 .ThenByDescending(credit => credit.Date)
                 .ToList();
 
-            var capped = all.Take(MaxPersonCredits).ToList();
+            var wantGenres = string.IsNullOrEmpty(genreIds) ? [] : ParseIdList(genreIds);
+            var filterByGenre = wantGenres.Count > 0;
 
-            // Resolve the IMDb ids here rather than telling the model to go and fetch them.
+            var order = sortBy?.Trim().ToLowerInvariant();
+            // Runtime is only known after the detail lookup below, so a runtime sort has to see more
+            // than the final 25 - same reason genre filtering does.
+            var sortNeedsRuntime = order is "longest" or "shortest";
+
+            // Genre filtering and runtime sorting both have to happen before the cap, so widen the
+            // candidate pool when either is asked for - filtering or sorting the top 25 by popularity
+            // would silently miss a qualifying film sitting at position 30.
+            var candidates = all.Take(filterByGenre || sortNeedsRuntime ? MaxGenreFilterLookups : MaxPersonCredits).ToList();
+
+            // Resolve details here rather than telling the model to go and fetch them.
             //
             // The first version of this method omitted ImdbId and pointed the model at DescribeMovie,
             // reasoning that skipping the fan-out was cheaper. Measured on the deployed app, it was the
@@ -276,34 +375,109 @@ namespace MovieTracker.Backend.Prompts
             // went from a max of 3 to a max of 10 against a cap of 12. The N+1 had not gone away, it had
             // moved from HTTP round trips into *model* iterations - roughly 1s each instead of 40ms, and
             // charged against the iteration budget, where running out truncates the answer.
-            var imdbIds = await ResolveImdbIdsAsync(
-                capped.Select(credit => int.TryParse(credit.MovieId, out var id) ? id : 0).Where(id => id > 0));
+            var facts = await ResolveMovieFactsAsync(
+                candidates.Select(credit => int.TryParse(credit.MovieId, out var id) ? id : 0).Where(id => id > 0));
 
-            var shown = capped.Select(credit => new
+            static MovieFacts FactsFor(Dictionary<int, MovieFacts> lookup, string movieId) =>
+                int.TryParse(movieId, out var id) && lookup.TryGetValue(id, out var found)
+                    ? found
+                    : new MovieFacts("", [], [], null);
+
+            var matching = filterByGenre
+                ? candidates.Where(credit => FactsFor(facts, credit.MovieId).GenreIds.Intersect(wantGenres).Any()).ToList()
+                : candidates;
+
+            // Sorting here rather than leaving the model to compare. Asked for Nolan's longest film with
+            // the runtimes sitting in front of it, gpt-5.4-mini repeatedly answered "The Odyssey at 173
+            // minutes, which edges out Oppenheimer by 8 minutes" - it computed the gap correctly and
+            // attributed it backwards, anchoring on whichever title came first. Ordering in code makes
+            // the answer the first element instead of an arithmetic exercise.
+            matching = order switch
+            {
+                "longest" => [.. matching.OrderByDescending(c => FactsFor(facts, c.MovieId).Runtime ?? 0)],
+                "shortest" => [.. matching
+                    .Where(c => FactsFor(facts, c.MovieId).Runtime is > 0)
+                    .OrderBy(c => FactsFor(facts, c.MovieId).Runtime)],
+                "newest" => [.. matching.OrderByDescending(c => c.Date)],
+                "oldest" => [.. matching.Where(c => c.Date > DateTime.MinValue).OrderBy(c => c.Date)],
+                _ => matching,
+            };
+
+            var shown = matching.Take(MaxPersonCredits).Select(credit => new
             {
                 credit.MovieId,
                 credit.MovieName,
                 credit.ReleaseDate,
                 credit.Credit,
-                ImdbId = int.TryParse(credit.MovieId, out var id) && imdbIds.TryGetValue(id, out var imdb) ? imdb : "",
+                FactsFor(facts, credit.MovieId).ImdbId,
+                // Carried even when no filter was applied: it lets the model narrow the list itself for
+                // anything the genre ids cannot express ("his war films", "something funny").
+                Genres = FactsFor(facts, credit.MovieId).GenreNames,
+                // Free - the detail lookup above already returned it. Without it "the longest film X
+                // directed" cannot be answered from this payload, and the model guesses a likely title
+                // and verifies only that one: asked for Nolan's longest it answered The Odyssey (173
+                // min) having never looked at Oppenheimer (181).
+                RuntimeMinutes = FactsFor(facts, credit.MovieId).Runtime,
             }).ToList();
 
             return JsonSerializer.Serialize(new
             {
                 PersonId = personId,
                 JobFilter = filterByJob ? wantJob : "(none - acting and all crew credits)",
-                TotalMatching = all.Count,
+                GenreFilter = filterByGenre ? genreIds : "(none)",
+                SortedBy = order is "longest" or "shortest" or "newest" or "oldest" ? order : "popularity",
+                TotalCredits = all.Count,
+                TotalMatching = matching.Count,
                 Returned = shown.Count,
                 Credits = shown,
                 // Say so rather than silently truncating, so the model does not present a capped list
                 // as a complete filmography.
-                Note = all.Count > shown.Count
-                    ? $"Showing {shown.Count} of {all.Count} matching credits, best known first."
+                Note = matching.Count > shown.Count
+                    ? $"Showing {shown.Count} of {matching.Count} matching credits, best known first."
                     : "Complete list for this filter.",
                 Hint = "ImdbId is included - pass it straight to GetMovieRating or CompareMovieRatings. "
                      + "No need to call DescribeMovie first."
             });
         }
+
+        /// <summary>Whether a job word refers to on-screen work or behind-the-camera work.</summary>
+        private enum CreditKind { Cast, Crew }
+
+        /// <summary>
+        /// Maps the job word the model supplies onto how TMDb actually credits it.
+        /// <para>
+        /// Two failures made this necessary, both caught by logging the arguments the model really
+        /// passed. First, <c>job=Actor</c>: acting is not a crew job in TMDb, so a naive crew-only
+        /// filter dropped the cast list *and* matched nothing, returning zero credits for "the worst
+        /// rated Adam Sandler movie" - a question about an actor's films. Second, <c>job=Writer</c>:
+        /// TMDb spreads writing across Writer, Screenplay and Story, so an exact match silently loses
+        /// whichever spelling a given film happens to use. Both are the obvious thing for a model to
+        /// pass, so both have to work.
+        /// </para>
+        /// <para>
+        /// An unrecognised value falls through as an exact crew-job match, which keeps the tool usable
+        /// for the long tail ("Costume Design") without needing a table of every TMDb job.
+        /// </para>
+        /// </summary>
+        private static (CreditKind Kind, string[] Jobs) ResolveJobFilter(string job) =>
+            job.Trim().ToLowerInvariant() switch
+            {
+                "actor" or "actress" or "acting" or "cast" or "star" or "starring" or "self"
+                    => (CreditKind.Cast, []),
+                "director" or "directed" or "directing" or "filmmaker"
+                    => (CreditKind.Crew, ["Director"]),
+                "writer" or "writing" or "written" or "screenwriter" or "screenplay" or "author"
+                    => (CreditKind.Crew, ["Writer", "Screenplay", "Story", "Author"]),
+                "producer" or "produced" or "producing"
+                    => (CreditKind.Crew, ["Producer", "Executive Producer", "Co-Producer", "Associate Producer"]),
+                "composer" or "music"
+                    => (CreditKind.Crew, ["Original Music Composer", "Composer", "Music"]),
+                "cinematographer" or "cinematography"
+                    => (CreditKind.Crew, ["Director of Photography", "Cinematography"]),
+                "editor" or "editing"
+                    => (CreditKind.Crew, ["Editor", "Film Editor"]),
+                _ => (CreditKind.Crew, [job.Trim()]),
+            };
 
         /// <summary>Year-bounds filter that treats an unparseable or absent year as "no bound".</summary>
         private static bool WithinYears(DateTime? releaseDate, string? fromYear, string? toYear)
@@ -495,10 +669,11 @@ namespace MovieTracker.Backend.Prompts
         }
 
         [Description("Get full details for one movie by its TMDb MovieId: overview, release date, genres " +
-                     "(with ids), runtime, tagline, language, top-billed cast, poster art and the ImdbId. " +
-                     "This is the single movie-detail tool - use it whenever you need more about a film " +
-                     "than a search result carries. For the rating, call GetMovieRating with the ImdbId " +
-                     "this returns.")]
+                     "(with ids), runtime, tagline, language, top-billed cast, poster art, worldwide box " +
+                     "office and budget, and the ImdbId. This is the single movie-detail tool - use it " +
+                     "whenever you need more about a film than a search result carries, including 'how " +
+                     "much did it make' and 'who was in it'. For the rating, call GetMovieRating with the " +
+                     "ImdbId this returns.")]
         [return: Description("Serialized JSON containing information about a specific movie including ImdbId")]
         public async Task<string> DescribeMovie([Description("The movie ID of a specific movie")] string movieId)
         {
@@ -528,6 +703,12 @@ namespace MovieTracker.Backend.Prompts
                 ImdbId = movie.ImdbId ?? "",
                 PosterPath = movie.PosterPath,
                 BackdropPath = movie.BackdropPath,
+                // Worldwide, in USD, straight off the movie record this call already fetched. Asked what
+                // Titanic made, the model previously had nowhere to get this and answered from memory
+                // via a Wikipedia context call. OMDb's BoxOffice is US-domestic only, so it is not a
+                // substitute for the figure people mean.
+                WorldwideRevenueUsd = movie.Revenue,
+                BudgetUsd = movie.Budget,
                 Cast = movie.Credits?.Cast?.Take(5).Select(c => c.Name).ToList() // Top 5 cast members
             };
 
@@ -587,7 +768,15 @@ namespace MovieTracker.Backend.Prompts
                        "orders by the TMDb vote average, which is not the IMDb rating: to answer a rating " +
                        "question, still call GetMovieRating or CompareMovieRatings on the results.")] string? sortBy = null,
           [Description("Optional: 'all' (default) requires a movie to match every genre id supplied; " +
-                       "'any' matches at least one. Use 'any' for 'action or comedy'.")] string? genreMatch = null
+                       "'any' matches at least one. Use 'any' for 'action or comedy'.")] string? genreMatch = null,
+          [Description("Optional: US content rating ceiling - 'G', 'PG', 'PG-13', 'R' or 'NC-17'. " +
+                       "Returns only films rated at or below it. Use this for anything about kids, " +
+                       "families or age-appropriateness; do not judge a film's rating yourself.")] string? maxCertification = null,
+          [Description("Optional: exact US content rating, e.g. 'PG-13'. Prefer maxCertification unless " +
+                       "the user asked for precisely one rating.")] string? certification = null,
+          [Description("Optional: longest runtime in minutes. Use this for 'under two hours' or " +
+                       "'something short' instead of fetching each film to check.")] int? maxRuntimeMinutes = null,
+          [Description("Optional: shortest runtime in minutes, for 'a proper long epic'.")] int? minRuntimeMinutes = null
       )
         {
             DiscoverMovie query = client.DiscoverMoviesAsync();
@@ -666,6 +855,35 @@ namespace MovieTracker.Backend.Prompts
                 }
             }
 
+            // Content rating. Without this the model had no way to honour "PG-13" or "for the kids", so
+            // it approximated with genre ids and its own sense of what is family-safe - and got it
+            // wrong: asked for PG-13 family movie night it returned The Matrix, which is rated R, and
+            // said it was not "full hard-R". TMDb keys certifications by country and only US is wired
+            // up here, which is the same assumption the rest of the app already makes.
+            if (!string.IsNullOrWhiteSpace(maxCertification))
+            {
+                query = query.WhereCertificationIsAtMost(CertificationCountry, maxCertification.Trim().ToUpperInvariant());
+            }
+
+            if (!string.IsNullOrWhiteSpace(certification))
+            {
+                query = query.WhereCertificationIs(CertificationCountry, certification.Trim().ToUpperInvariant());
+            }
+
+            // Runtime. Without these, "a 70s horror film under two hours" ran an unfiltered discover and
+            // then spent five DescribeMovie calls checking runtimes one at a time - the same N+1 through
+            // the model that GetPersonMovieCredits used to cause, and it still let a 122-minute film
+            // through. TMDb can answer this in the same request.
+            if (maxRuntimeMinutes is > 0)
+            {
+                query = query.WhereRuntimeIsAtMost(maxRuntimeMinutes.Value);
+            }
+
+            if (minRuntimeMinutes is > 0)
+            {
+                query = query.WhereRuntimeIsAtLeast(minRuntimeMinutes.Value);
+            }
+
             // Apply vote average filters
             if (minVoteAverage.HasValue)
             {
@@ -690,6 +908,7 @@ namespace MovieTracker.Backend.Prompts
 
             // Execute query and get results with IMDb IDs
             var searchResults = await query.Query();
+            var wantsRuntimeFilter = maxRuntimeMinutes is > 0 || minRuntimeMinutes is > 0;
 
             // A bare "[]" tells the model nothing about why, and an empty lookup is precisely the moment
             // it stops calling functions and starts answering from memory. Filtering a director as cast
@@ -704,6 +923,40 @@ namespace MovieTracker.Backend.Prompts
                     Hint = "No movies matched those cast ids. If the person is a director, writer or "
                          + "producer rather than an actor, pass their PersonId as crewIds instead of "
                          + "castIds and try again. Do not answer from memory."
+                });
+            }
+
+            // TMDb's with_runtime cannot be trusted, so it is used to narrow the set and then verified
+            // here. Measured against the live API: with_runtime.gte=181 returned Spider-Man (121 min),
+            // Interstellar (169) and Fellowship of the Ring (179) - six of the first ten results
+            // contradicted TMDb's *own* runtime field, because the filter matches alternate release cuts
+            // rather than the canonical runtime. Sending that back unchecked is how "under two hours"
+            // came back with a 124-minute film.
+            if (wantsRuntimeFilter)
+            {
+                var facts = await ResolveMovieFactsAsync(searchResults.Results.Select(movie => movie.Id));
+
+                var verified = searchResults.Results
+                    .Select(movie => (Movie: movie, Runtime: facts.TryGetValue(movie.Id, out var f) ? f.Runtime : null))
+                    // An unknown runtime cannot be shown to satisfy the constraint, so it is dropped
+                    // rather than assumed to pass.
+                    .Where(entry => entry.Runtime is > 0
+                        && (maxRuntimeMinutes is not > 0 || entry.Runtime <= maxRuntimeMinutes)
+                        && (minRuntimeMinutes is not > 0 || entry.Runtime >= minRuntimeMinutes))
+                    .Select(entry => new MovieSearchResult(
+                        entry.Movie.Id.ToString(),
+                        entry.Movie.Title ?? "",
+                        entry.Movie.ReleaseDate?.ToString("yyyy-MM-dd") ?? "",
+                        facts.TryGetValue(entry.Movie.Id, out var found) ? found.ImdbId : "",
+                        entry.Runtime))
+                    .ToList();
+
+                return JsonSerializer.Serialize(new
+                {
+                    Results = verified,
+                    Note = $"{verified.Count} of {searchResults.Results.Count} results actually satisfy the "
+                         + "runtime filter; TMDb's own runtime filter is unreliable, so the rest were "
+                         + "verified and dropped here. RuntimeMinutes is the checked value.",
                 });
             }
 

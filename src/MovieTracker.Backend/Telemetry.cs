@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using Microsoft.Extensions.AI;
+using Microsoft.Extensions.Logging;
 
 namespace MovieTracker.Backend;
 
@@ -139,7 +140,10 @@ internal static class Telemetry
 /// Deliberately emits no Activity: the framework already opens an
 /// <c>execute_tool &lt;name&gt;</c> span around this call.
 /// </summary>
-internal sealed class InstrumentedAIFunction(AIFunction inner) : DelegatingAIFunction(inner)
+internal sealed class InstrumentedAIFunction(
+    AIFunction inner,
+    ILogger? logger = null,
+    bool logArguments = false) : DelegatingAIFunction(inner)
 {
     protected override async ValueTask<object?> InvokeCoreAsync(
         AIFunctionArguments arguments, CancellationToken cancellationToken)
@@ -149,15 +153,72 @@ internal sealed class InstrumentedAIFunction(AIFunction inner) : DelegatingAIFun
         {
             var result = await base.InvokeCoreAsync(arguments, cancellationToken);
             Telemetry.RecordTool(Name, stopwatch.Elapsed, succeeded: true);
+            LogCall(arguments, stopwatch.Elapsed, error: null);
             return result;
         }
-        catch
+        catch (Exception ex)
         {
             // Rethrown untouched. The framework catches it, records it on its own execute_tool span,
             // and hands the model a correctable error - which several tools here rely on.
             Telemetry.RecordTool(Name, stopwatch.Elapsed, succeeded: false);
+            LogCall(arguments, stopwatch.Elapsed, ex);
             throw;
         }
+    }
+
+    /// <summary>
+    /// Which tool the model chose and what it passed.
+    /// <para>
+    /// The metrics above give counts and durations but not arguments, and the framework's
+    /// <c>execute_tool</c> spans - which do carry them - are sampled away: host.json enables adaptive
+    /// sampling and a spot check found 5 surviving spans against 107 real calls. So when an answer is
+    /// wrong there is otherwise no way to see *why*, and tool-selection bugs live almost entirely in
+    /// the arguments: a director filtered as cast, a job filter applied to a question that wanted
+    /// acting credits, a genre the model decided to apply itself instead of passing down.
+    /// </para>
+    /// <para>
+    /// Gated on <c>Telemetry:Enable-Sensitive-Data</c>, because arguments contain the names and titles
+    /// the user asked about. Names only when that is off.
+    /// </para>
+    /// </summary>
+    private void LogCall(AIFunctionArguments arguments, TimeSpan elapsed, Exception? error)
+    {
+        if (logger is null || !logger.IsEnabled(LogLevel.Information))
+        {
+            return;
+        }
+
+        var rendered = logArguments ? Render(arguments) : "(arguments not logged)";
+
+        if (error is null)
+        {
+            logger.LogInformation("tool {ToolName}({ToolArguments}) ok in {ElapsedMs}ms",
+                Name, rendered, (int)elapsed.TotalMilliseconds);
+        }
+        else
+        {
+            logger.LogWarning("tool {ToolName}({ToolArguments}) FAILED in {ElapsedMs}ms: {Error}",
+                Name, rendered, (int)elapsed.TotalMilliseconds, error.Message);
+        }
+    }
+
+    private const int MaxLoggedArgumentChars = 120;
+
+    private static string Render(AIFunctionArguments arguments)
+    {
+        if (arguments is null || arguments.Count == 0) return string.Empty;
+
+        return string.Join(", ", arguments
+            .Where(argument => argument.Value is not null)
+            .Select(argument =>
+            {
+                var value = argument.Value!.ToString() ?? string.Empty;
+                if (value.Length > MaxLoggedArgumentChars)
+                {
+                    value = value[..MaxLoggedArgumentChars] + "...";
+                }
+                return $"{argument.Key}={value}";
+            }));
     }
 }
 

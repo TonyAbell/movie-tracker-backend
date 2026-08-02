@@ -1,108 +1,84 @@
-﻿using Microsoft.Extensions.AI;
-using Microsoft.Extensions.Configuration;
 using System.Text.Json;
 using TMDbLib.Client;
 
 namespace MovieTracker.Backend.Agents
 {
-    public class TrailerAgent
+    /// <summary>
+    /// Resolves a movie title to its best official YouTube trailer.
+    ///
+    /// This used to take the user's raw question and run an LLM extraction prompt over it to find the
+    /// title, behind a keyword gate that decided whether the question was about trailers at all. Both
+    /// are gone, because both were solving a problem at the wrong layer:
+    ///
+    /// - The extraction prompt only ever saw the single string handed to the tool, never the
+    ///   conversation. So "show me the trailer for that one", immediately after the assistant named
+    ///   The Dark Knight, extracted UNKNOWN and apologised - the model knew the referent and was told
+    ///   to discard it. The caller resolves the title now, which is the only layer that can.
+    /// - The keyword gate ("does this contain the word trailer?") was guessing at intent that the model
+    ///   has already decided by choosing to call this at all. It also fired on "show me Tom Hanks
+    ///   movies" until it was tightened.
+    ///
+    /// Dropping them removes a completion from the critical path and the IChatClient dependency with it.
+    /// </summary>
+    public class TrailerAgent(TMDbClient tmdbClient)
     {
-        private readonly TMDbClient tmdbClient;
-
-        // The bare IChatClient, deliberately not the AIAgent: this is a single-shot extraction prompt
-        // that must not inherit the agent's tool set or its JSON response format. Under Semantic
-        // Kernel this was kernel.GetRequiredService<IChatCompletionService>() called with no
-        // execution settings, which had the same effect.
-        private readonly IChatClient chatClient;
-
-        // Words that mean "video content" on their own and nothing else.
-        private static readonly string[] TrailerNouns = {
-            "trailer", "teaser", "preview", "promo", "featurette", "attraction video"
-        };
-
-        // These only count when paired with one of the nouns below. The list used to include "watch",
-        // "play" and "show" as standalone triggers, which fired on a large share of perfectly ordinary
-        // queries - "show me Tom Hanks movies" routed a plain filmography question into a trailer
-        // lookup: an extra completion to extract a title, a TMDb search and a videos call, and an
-        // apology string when it found nothing.
-        private static readonly string[] PlaybackVerbs = { "watch", "play", "show", "see" };
-        private static readonly string[] VideoNouns = { "video", "footage", "clip" };
-
-        public TrailerAgent(TMDbClient tmdbClient, IChatClient chatClient)
+        public async Task<string> GetTrailerForTitle(string movieTitle)
         {
-            this.tmdbClient = tmdbClient;
-            this.chatClient = chatClient;
-        }
+            var title = movieTitle?.Trim();
 
-        public bool CanHandle(string userQuery)
-        {
-            if (string.IsNullOrWhiteSpace(userQuery)) return false;
-
-            if (TrailerNouns.Any(noun => userQuery.Contains(noun, StringComparison.OrdinalIgnoreCase)))
+            if (string.IsNullOrWhiteSpace(title) || title.Equals("UNKNOWN", StringComparison.OrdinalIgnoreCase))
             {
-                return true;
+                return JsonSerializer.Serialize(new
+                {
+                    Error = "No movie title was supplied.",
+                    Hint = "Pass the film's title. If the user referred to it indirectly - 'that one', "
+                         + "'it' - use the title from earlier in the conversation; this tool cannot see it."
+                });
             }
 
-            // "watch the video", "play that clip" - the verb alone is not evidence of anything.
-            return PlaybackVerbs.Any(verb => userQuery.Contains(verb, StringComparison.OrdinalIgnoreCase))
-                && VideoNouns.Any(noun => userQuery.Contains(noun, StringComparison.OrdinalIgnoreCase));
-        }
+            var searchResults = await tmdbClient.SearchMovieAsync(title);
+            var match = searchResults.Results.FirstOrDefault();
 
-        public async Task<string> HandleRequest(string userQuery)
-        {
-            var movieTitle = await ExtractMovieTitle(userQuery);
-            if (string.IsNullOrWhiteSpace(movieTitle))
-                return "Sorry, I couldn't determine which movie you want a trailer for.";
+            if (match is null)
+            {
+                return JsonSerializer.Serialize(new
+                {
+                    Error = $"No movie found matching '{title}'.",
+                    Hint = "Check the title, or call SearchMovies to find the right one first."
+                });
+            }
 
-            var movieId = await SearchForMovie(movieTitle);
-            if (string.IsNullOrWhiteSpace(movieId))
-                return $"Sorry, I couldn't find a movie titled '{movieTitle}'.";
+            var videos = await tmdbClient.GetMovieVideosAsync(match.Id);
 
-            var trailerUrl = await GetTrailerUrl(movieId);
-            if (string.IsNullOrWhiteSpace(trailerUrl))
-                return $"Sorry, a trailer for '{movieTitle}' could not be found.";
-
-            return $"[TRAILER]{trailerUrl}[/TRAILER]";
-        }
-
-        private async Task<string> ExtractMovieTitle(string userQuery)
-        {
-            var prompt = $@"
-                Extract the movie title from: '{userQuery}'
-                Return ONLY the movie title, or 'UNKNOWN' if no specific movie is mentioned.
-                
-                Examples:
-                'show me the batman trailer' -> 'The Batman'
-                'play inception trailer' -> 'Inception'
-                'trailer please' -> 'UNKNOWN'
-                ";
-
-            var result = await chatClient.GetResponseAsync(prompt);
-            var movieTitle = result.Text?.Trim();
-
-            return movieTitle?.ToUpper() == "UNKNOWN" ? "" : movieTitle ?? "";
-        }
-
-        private async Task<string> SearchForMovie(string movieTitle)
-        {
-            var searchResults = await tmdbClient.SearchMovieAsync(movieTitle);
-
-            return searchResults.Results.FirstOrDefault()?.Id.ToString() ?? "";
-        }
-
-        private async Task<string> GetTrailerUrl(string movieId)
-        {
-            var videos = await tmdbClient.GetMovieVideosAsync(int.Parse(movieId));
-
-            // Same ordering as ProcessMovieAsync in Function.cs, size included. Without the size tie-break
-            // the two paths could pick different trailers for the same film.
+            // Same ordering as ProcessMovieAsync in Function.cs, size included. Without the size
+            // tie-break the two paths could pick different trailers for the same film.
             var trailer = videos.Results
-                .Where(v => v.Type == "Trailer" && v.Site == "YouTube")
-                .OrderByDescending(v => v.Official)
-                .ThenByDescending(v => v.Size)
+                .Where(video => video.Type == "Trailer" && video.Site == "YouTube")
+                .OrderByDescending(video => video.Official)
+                .ThenByDescending(video => video.Size)
                 .FirstOrDefault();
 
-            return trailer != null ? $"https://www.youtube.com/watch?v={trailer.Key}" : "";
+            if (trailer is null)
+            {
+                return JsonSerializer.Serialize(new
+                {
+                    MovieId = match.Id.ToString(),
+                    MovieName = match.Title,
+                    Error = $"No YouTube trailer is available for '{match.Title}'.",
+                    Hint = "Say so plainly rather than substituting a different film's trailer."
+                });
+            }
+
+            return JsonSerializer.Serialize(new
+            {
+                MovieId = match.Id.ToString(),
+                MovieName = match.Title,
+                ReleaseDate = match.ReleaseDate?.ToString("yyyy-MM-dd") ?? "",
+                TrailerName = trailer.Name,
+                // The system prompt requires this wrapper in SystemMessage for the frontend to render
+                // the player inline, so it is handed over pre-wrapped rather than described.
+                EmbedInSystemMessage = $"[TRAILER]https://www.youtube.com/watch?v={trailer.Key}[/TRAILER]"
+            });
         }
     }
 }

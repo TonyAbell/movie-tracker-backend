@@ -59,28 +59,14 @@ namespace MovieTracker.Backend.Prompts
             AIFunctionFactory.Create(GetMovieContext),
         ];
 
-        [Description("Handle a request for a movie trailer and return a clickable trailer link. " +
-                     "Only call this when the user actually asked for a trailer, teaser, preview or promo.")]
+        [Description("Get a movie's trailer link from its title. Call this when the user asks for a " +
+                     "trailer, teaser, preview or promo. Returns the [TRAILER]...[/TRAILER] string to " +
+                     "embed in SystemMessage.")]
         public async Task<string> HandleTrailerRequest(
-            [Description("The user's request, verbatim")] string userQuery)
-        {
-            if (trailerAgent.CanHandle(userQuery))
-            {
-                return await trailerAgent.HandleRequest(userQuery);
-            }
-
-            // Used to return GenerateRequiredSteps(), a restatement of the response schema whose worked
-            // example contained "MovieId": "1" - a fabricated id of exactly the kind the system prompt
-            // forbids - plus an ImdbId field that DisallowAdditionalProperties rejects. Handing that to
-            // the model mid-conversation taught it the wrong shape. Same {Error, Hint} envelope the TMDb
-            // tools use for a correctable mistake.
-            return JsonSerializer.Serialize(new
-            {
-                Error = "That does not look like a trailer request, so no trailer was looked up.",
-                Hint = "Answer the question with the movie search tools instead. Only call " +
-                       "HandleTrailerRequest when the user asks for a trailer, teaser, preview or promo."
-            });
-        }
+            [Description("The film's title. Resolve any reference yourself first - if the user said " +
+                         "'that one' or 'it', pass the title you named earlier in the conversation. " +
+                         "This tool cannot see the conversation, only this argument.")] string movieTitle)
+            => await trailerAgent.GetTrailerForTitle(movieTitle);
 
         // Absorbs the description GetMovieRatingGeneric used to carry, since that near-duplicate tool is
         // no longer offered: the "user said rating without naming a source" case is the whole reason it

@@ -19,6 +19,13 @@ namespace MovieTracker.Backend.Prompts
         private const int MaxConcurrentTmdbCalls = 8;
 
         /// <summary>
+        /// Cap on credits returned per person. A prolific actor has hundreds, and every one of them is
+        /// context the model pays for on this turn and every turn after it until compaction collapses
+        /// the call. The payload says how many were withheld rather than truncating silently.
+        /// </summary>
+        private const int MaxPersonCredits = 25;
+
+        /// <summary>
         /// Resolves the IMDb id for each search hit and projects the pair into a MovieSearchResult.
         /// <para>
         /// TMDb has no batch endpoint for external ids, so this is one call per result either way - but
@@ -106,6 +113,7 @@ namespace MovieTracker.Backend.Prompts
         [
             AIFunctionFactory.Create(GetGenresList),
             AIFunctionFactory.Create(SearchForPeople),
+            AIFunctionFactory.Create(GetPersonMovieCredits),
             AIFunctionFactory.Create(SearchMovies),
             AIFunctionFactory.Create(GetMovieTrailers),
             AIFunctionFactory.Create(SearchKeywords),
@@ -118,9 +126,15 @@ namespace MovieTracker.Backend.Prompts
         /// one returned by a search. Throwing on those aborts the whole chat turn, so instead hand
         /// the model a description of what it did wrong and let it correct itself.
         /// </summary>
-        private static bool TryGetTmdbId(string? movieId, out int id, out string error)
+        private static bool TryGetTmdbId(string? movieId, out int id, out string error) =>
+            TryGetId(movieId, "movie", "13", "Call SearchMovies or DiscoverMovies first and use the MovieId it returns.", out id, out error);
+
+        private static bool TryGetPersonId(string? personId, out int id, out string error) =>
+            TryGetId(personId, "person", "525", "Call SearchForPeople first and use the PersonId it returns.", out id, out error);
+
+        private static bool TryGetId(string? value, string kind, string example, string hint, out int id, out string error)
         {
-            if (int.TryParse(movieId, out id))
+            if (int.TryParse(value, out id))
             {
                 error = string.Empty;
                 return true;
@@ -128,8 +142,8 @@ namespace MovieTracker.Backend.Prompts
 
             error = JsonSerializer.Serialize(new
             {
-                Error = $"'{movieId}' is not a valid TMDb movie id. Ids are numeric, e.g. '13'.",
-                Hint = "Call SearchMovies or DiscoverMovies first and use the MovieId it returns."
+                Error = $"'{value}' is not a valid TMDb {kind} id. Ids are numeric, e.g. '{example}'.",
+                Hint = hint
             });
             return false;
         }
@@ -165,6 +179,117 @@ namespace MovieTracker.Backend.Prompts
             var searchResults = await client.SearchPersonAsync(personName, includeAdult: false);
             var personSearchResults = searchResults.Results.Select(p => new PersonSearchResult(p.Id.ToString(), p.Name)).ToList();
             return JsonSerializer.Serialize(personSearchResults);
+        }
+
+        /// <summary>
+        /// A person's filmography, with the job they actually did on each film.
+        /// <para>
+        /// This exists because TMDb's discover endpoint can filter by crew <i>membership</i> but not by
+        /// crew <i>job</i>. `DiscoverMovies(crewIds:)` therefore answers "worked on" rather than
+        /// "directed", and measured against the live API that is a wide gap: Tarantino's 1990s crew
+        /// results include True Romance (Writer), Natural Born Killers (Story), Killing Zoe (Executive
+        /// Producer) and Jackie Chan: My Story, where his only credit is <c>Thanks</c>. One call here
+        /// returns every credit already carrying its Job, so it is both more accurate than
+        /// discover-then-filter and cheaper than it.
+        /// </para>
+        /// </summary>
+        [Description("Get one person's filmography from their PersonId, with the exact job they did on " +
+                     "each film. This is the right tool for 'what did X direct', 'what did X write' and " +
+                     "'what has X been in', because it is the only one that can tell a directing credit " +
+                     "from a writing or producing one - pass job='Director' for 'directed by'. Prefer " +
+                     "this over DiscoverMovies(crewIds:) for any question about one person's own work.")]
+        [return: Description("JSON with the person's credits: MovieId, MovieName, ReleaseDate and either Character (acting) or Job")]
+        public async Task<string> GetPersonMovieCredits(
+            [Description("The TMDb PersonId, as returned by SearchForPeople")] string personId,
+            [Description("Optional: keep only credits with this exact job, e.g. 'Director', 'Screenplay', " +
+                         "'Producer'. Use 'Director' for 'directed by'. Omit for acting roles plus all crew work.")] string? job = null,
+            [Description("Optional: only films released in or after this year (YYYY)")] string? fromYear = null,
+            [Description("Optional: only films released in or before this year (YYYY)")] string? toYear = null)
+        {
+            if (!TryGetPersonId(personId, out var tmdbPersonId, out var idError)) return idError;
+
+            var credits = await client.GetPersonMovieCreditsAsync(tmdbPersonId);
+
+            var wantJob = job?.Trim();
+            var filterByJob = !string.IsNullOrEmpty(wantJob);
+
+            // Acting credits are only relevant when no crew job was asked for - "what did Nolan direct"
+            // should not come back with his cameos.
+            var acting = filterByJob
+                ? []
+                : (credits.Cast ?? []).Select(role => new
+                {
+                    MovieId = role.Id.ToString(),
+                    MovieName = role.Title,
+                    role.ReleaseDate,
+                    Credit = string.IsNullOrWhiteSpace(role.Character) ? "Actor" : $"as {role.Character}",
+                    // Only cast credits carry this; MovieJob has no popularity at all.
+                    Popularity = (double?)role.Popularity,
+                }).ToList();
+
+            var working = (credits.Crew ?? [])
+                .Where(crew => !filterByJob || string.Equals(crew.Job, wantJob, StringComparison.OrdinalIgnoreCase))
+                .Select(crew => new
+                {
+                    MovieId = crew.Id.ToString(),
+                    MovieName = crew.Title,
+                    crew.ReleaseDate,
+                    Credit = crew.Job,
+                    Popularity = (double?)null,
+                })
+                .ToList();
+
+            var all = acting.Concat(working)
+                .Where(credit => WithinYears(credit.ReleaseDate, fromYear, toYear))
+                // The same film can appear once per job (Tarantino is Writer *and* Director on Pulp
+                // Fiction); collapse those so the model sees one entry per movie.
+                .GroupBy(credit => credit.MovieId)
+                .Select(group => new
+                {
+                    group.First().MovieId,
+                    group.First().MovieName,
+                    ReleaseDate = group.First().ReleaseDate?.ToString("yyyy-MM-dd") ?? "",
+                    Credit = string.Join(", ", group.Select(c => c.Credit).Distinct()),
+                    Popularity = group.Max(c => c.Popularity),
+                    Date = group.First().ReleaseDate ?? DateTime.MinValue,
+                })
+                // Popularity first where it exists, so "what has Meg Ryan been in?" leads with When Harry
+                // Met Sally rather than whatever she filmed most recently - sorting acting credits by date
+                // buries the famous work under the obscure. Crew credits have no popularity, so a
+                // job-filtered query falls through to newest-first, which is what you want for those.
+                .OrderByDescending(credit => credit.Popularity ?? -1)
+                .ThenByDescending(credit => credit.Date)
+                .ToList();
+
+            var shown = all.Take(MaxPersonCredits)
+                .Select(c => new { c.MovieId, c.MovieName, c.ReleaseDate, c.Credit })
+                .ToList();
+
+            return JsonSerializer.Serialize(new
+            {
+                PersonId = personId,
+                JobFilter = filterByJob ? wantJob : "(none - acting and all crew credits)",
+                TotalMatching = all.Count,
+                Returned = shown.Count,
+                Credits = shown,
+                // Say so rather than silently truncating, so the model does not present a capped list
+                // as a complete filmography.
+                Note = all.Count > shown.Count
+                    ? $"Showing {shown.Count} of {all.Count} matching credits, best known first."
+                    : "Complete list for this filter.",
+                Hint = "These carry no ImdbId. Call DescribeMovie with a MovieId to get one for GetMovieRating."
+            });
+        }
+
+        /// <summary>Year-bounds filter that treats an unparseable or absent year as "no bound".</summary>
+        private static bool WithinYears(DateTime? releaseDate, string? fromYear, string? toYear)
+        {
+            if (releaseDate is not { } date) return string.IsNullOrEmpty(fromYear) && string.IsNullOrEmpty(toYear);
+
+            if (int.TryParse(fromYear, out var from) && date.Year < from) return false;
+            if (int.TryParse(toYear, out var to) && date.Year > to) return false;
+
+            return true;
         }
 
         [Description("Search for movies by their title and release year. Use this to find movies, you can search by movie name or part of a movie name")]
@@ -421,10 +546,12 @@ namespace MovieTracker.Backend.Prompts
           [Description("Optional: End release date (YYYY-MM-DD)")] string? releaseDateTo = null,
           [Description("Optional: Include movies these people ACTED in, as comma-separated PersonIds. " +
                        "Actors only - a director will not match here.")] string? castIds = null,
-          [Description("Optional: Include movies these people worked on BEHIND the camera, as " +
-                       "comma-separated PersonIds - directors, writers, producers, composers. " +
-                       "Use this for 'directed by', 'written by' or 'films by'. A director does not " +
-                       "appear in castIds, so filtering a director as cast returns nothing.")] string? crewIds = null,
+          [Description("Optional: Include movies these people worked on BEHIND the camera in ANY role - " +
+                       "director, writer, producer, composer, editor - as comma-separated PersonIds. " +
+                       "This cannot distinguish those roles: it matches any crew credit, including " +
+                       "'Thanks'. For 'directed by' or 'written by' specifically, use " +
+                       "GetPersonMovieCredits with a job filter instead. Use this one only to combine a " +
+                       "behind-the-camera person with other filters like genre or date.")] string? crewIds = null,
           [Description("Optional: Include movies with these genre IDs (comma-separated)")] string? genreIds = null,
           [Description("Optional: Include movies with these keyword IDs (comma-separated)")] string? keywordIds = null,
           [Description("Optional: Minimum vote average (1-10)")] double? minVoteAverage = null,

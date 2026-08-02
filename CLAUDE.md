@@ -116,7 +116,7 @@ The `.Use(...)` is function-invocation middleware that caps the tool-calling loo
 
 There is no attribute-driven tool discovery any more. `Plugins.AddFromType<T>()` is replaced by explicit `CreateTools()` methods returning `IEnumerable<AITool>` built with `AIFunctionFactory.Create`, and `Program.cs` unions the three sources. **Adding a `[Description]`-annotated method without adding it to the matching `CreateTools()` leaves it invisible to the model** — this is the single easiest thing to get wrong.
 
-The model sees **20** tools (7 TMDb + 7 date + 6 `ChatPlanner`). Every tool schema rides in the cached prompt prefix on every call, so the count is a permanent per-request cost.
+The model sees **21** tools (8 TMDb + 7 date + 6 `ChatPlanner`). Every tool schema rides in the cached prompt prefix on every call, so the count is a permanent per-request cost.
 
 Not offered, on purpose:
 
@@ -128,7 +128,19 @@ Not offered, on purpose:
 
 The seven date helpers were kept on purpose: their schemas are tiny and they exist precisely to stop the model inventing date ranges.
 
-**`DiscoverMovies` takes `crewIds` as well as `castIds`, and the distinction is load-bearing.** TMDb files directing/writing/producing credits separately from acting credits, and only `with_cast` was ever wired up — so "sci-fi directed by Christopher Nolan" resolved him correctly to PersonId 525, filtered it as *cast*, and got **zero rows**. Measured: `with_cast=525` + genre 878 → 0 results; `with_cast=525` alone → documentaries *about* him; `with_crew=525` + genre 878 → Interstellar, Inception, The Prestige, Tenet. An empty result is exactly when the model stops calling functions and answers from memory, which is how "Nolan sci-fi" came back as *Harry Potter* and *Die Hard 2*. The tool now also returns an explicit `Hint` instead of a bare `[]` when a cast filter matches nothing.
+**Person questions need the right one of three filters, and getting it wrong fails silently.** TMDb files directing/writing/producing credits separately from acting credits, and originally only `with_cast` was wired up — so "sci-fi directed by Christopher Nolan" resolved him correctly to PersonId 525, filtered it as *cast*, and got **zero rows**. Measured: `with_cast=525` + genre 878 → 0 results; `with_cast=525` alone → documentaries *about* him; `with_crew=525` + genre 878 → Interstellar, Inception, The Prestige, Tenet. An empty result is exactly when the model stops calling functions and answers from memory, which is how "Nolan sci-fi" came back as *Harry Potter* and *Die Hard 2*. `DiscoverMovies` now also returns an explicit `Hint` instead of a bare `[]` when a cast filter matches nothing.
+
+`with_crew` alone is *not* "directed by" either — discover can filter by crew membership but **not by job**. Measured on Tarantino's 1990s crew results: alongside four directing credits it returns *True Romance* (Writer), *Natural Born Killers* (Story), *Killing Zoe* (Executive Producer) and *Jackie Chan: My Story*, where his only credit is **`Thanks`**. That is why `GetPersonMovieCredits` exists — one call returns every credit already carrying its `Job`, so it is both more accurate than discover-then-filter and cheaper. The rule the system prompt teaches:
+
+| Question | Tool |
+|---|---|
+| "what did X direct / write" | `GetPersonMovieCredits(personId, job: "Director")` |
+| "what has X been in" | `GetPersonMovieCredits(personId)` — no job filter |
+| person **combined with** genre/date/rating filters | `DiscoverMovies(castIds:)` or `(crewIds:)` |
+
+`GetPersonMovieCredits` sorts by popularity where it exists and falls back to release date. Only `MovieRole` (cast) carries `Popularity`; `MovieJob` (crew) does not. That split is deliberate: sorting acting credits by date makes "what has Meg Ryan been in?" lead with her most recent obscure work instead of *When Harry Met Sally*, while a job-filtered crew list is short and complete so newest-first is fine. Capped at `MaxPersonCredits` (25) with the withheld count stated in the payload rather than truncated silently.
+
+One thing that looks like a bug and is not: a person's credits can contain the same title twice with **different TMDb ids** — Tarantino has *Reservoir Dogs* as both `500` (1992 feature) and `443129` (1991 short), and *From Dusk Till Dawn* as `755` and `1623134`. Both are real upstream records. They are not deduplicated, because collapsing by title would silently drop a genuine credit.
 
 - `Prompts/TheMovieDBKernelFunctions.cs` — the main TMDb surface (genres, person search, movie search, discover with filters and sort, movie details, trailers/videos). Takes an **injected singleton `TMDbClient`**; `new TMDbClient(apiKey)` used to appear 14 times across the app (once per tool method, twice in `TrailerAgent`, twice per HTTP function), so nothing reused a connection and TMDb's API config was re-fetched per instance. The DI registration is also the one place a default language or region could go.
 

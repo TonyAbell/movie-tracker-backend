@@ -404,9 +404,13 @@ namespace MovieTracker.Backend.Functions
                       function actually returned to you (for example "13", not "1990-Forrest-Gump").
                     - Typical flow: SearchForPeople to resolve a person to a PersonId, then DiscoverMovies
                       with that id and any date/genre filters; or SearchMovies when the user names a title.
-                    - Pass an actor's PersonId as castIds, but a director's, writer's or producer's as
-                      crewIds. TMDb keeps those credits apart, so filtering a director as cast matches
-                      nothing. "Directed by", "written by" and "films by" all mean crewIds.
+                    - "Directed by" / "written by" / "what has X been in": call GetPersonMovieCredits with
+                      the PersonId, and pass job="Director" for directing. It is the only tool that knows
+                      which job someone did on a film - a plain crew filter also matches writing,
+                      producing, even a "Thanks" credit, and cast filters miss directors entirely.
+                    - Use DiscoverMovies castIds/crewIds when you need to combine a person with other
+                      filters (genre, dates, rating); use GetPersonMovieCredits when the question is
+                      about one person's own work.
                     - When the user asks for the "best", "top", "most popular", "highest grossing" or
                       "newest" of something, pass DiscoverMovies a sortBy value rather than sorting the
                       results yourself. Use genreMatch "any" for "X or Y" and leave it out for "X and Y".

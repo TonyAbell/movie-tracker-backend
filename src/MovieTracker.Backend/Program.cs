@@ -288,7 +288,7 @@ var host = new HostBuilder()
             // Wrapped for per-tool duration and failure metrics. The framework traces tool calls but
             // emits no tool metric, and traces are sampled - so without this there is no reliable way
             // to see that, say, OMDb has started timing out. InstrumentedAIFunction forwards name,
-            // description and schema untouched, so the model sees exactly the same 20 tools.
+            // description and schema untouched, so the model sees exactly the same 21 tools.
             List<AITool> tools =
             [
                 .. theMovieDbFunctions.CreateTools(),

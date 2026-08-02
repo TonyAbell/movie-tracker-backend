@@ -295,8 +295,16 @@ var host = new HostBuilder()
                 .. DateTimeKernelFunctions.CreateTools(),
                 .. chatPlanner.CreateTools(),
             ];
+            // The logger is what makes tool *selection* debuggable. Metrics say DiscoverMovies ran twice;
+            // only this says whether it ran with a cast filter or a crew filter, which is the difference
+            // between a right and a wrong answer. Its own category so it can be turned down on its own.
+            var toolLogger = serviceProvider.GetRequiredService<ILoggerFactory>()
+                .CreateLogger("MovieTracker.Backend.ToolCalls");
+
             tools = [.. tools.Select(tool =>
-                tool is AIFunction function ? new InstrumentedAIFunction(function) : tool)];
+                tool is AIFunction function
+                    ? new InstrumentedAIFunction(function, toolLogger, enableSensitiveTelemetry)
+                    : tool)];
 
             // ChatClientAgent decorates the chat client with automatic function invocation by default,
             // which is what ToolCallBehavior.AutoInvokeKernelFunctions used to switch on. The

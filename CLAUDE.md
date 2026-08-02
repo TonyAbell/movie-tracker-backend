@@ -138,6 +138,11 @@ The seven date helpers were kept on purpose: their schemas are tiny and they exi
 | "what has X been in" | `GetPersonMovieCredits(personId)` — no job filter |
 | person **combined with** genre/date/rating filters | `DiscoverMovies(castIds:)` or `(crewIds:)` |
 
+**Two upstream traps found by stress-testing the tool surface, both of which produce confidently wrong answers:**
+
+- **`job` is not a raw TMDb crew job.** The model naturally passes `job=Actor` for "his movies" — but acting is not a crew job in TMDb, so an exact crew-only match returns **zero** and the question dies. It also passes `job=Writer`, while TMDb spreads writing across `Writer`, `Screenplay` and `Story`. `ResolveJobFilter` maps job words onto cast-vs-crew and onto every spelling TMDb uses; unrecognised values fall through as an exact crew match so the long tail still works.
+- **TMDb's `with_runtime` filter contradicts TMDb's own runtime field.** Measured: `with_runtime.gte=181` returned Spider-Man (121 min), Interstellar (169) and Fellowship of the Ring (179) — **six of the first ten results violated the filter**, because it matches alternate release cuts. `DiscoverMovies` therefore uses it only to narrow, then re-checks every result against the canonical runtime and drops the rest. Do not remove that verification pass; without it "under two hours" returns 124-minute films.
+
 `GetPersonMovieCredits` sorts by popularity where it exists and falls back to release date. Only `MovieRole` (cast) carries `Popularity`; `MovieJob` (crew) does not. That split is deliberate: sorting acting credits by date makes "what has Meg Ryan been in?" lead with her most recent obscure work instead of *When Harry Met Sally*, while a job-filtered crew list is short and complete so newest-first is fine. Capped at `MaxPersonCredits` (25) with the withheld count stated in the payload rather than truncated silently.
 
 One thing that looks like a bug and is not: a person's credits can contain the same title twice with **different TMDb ids** — Tarantino has *Reservoir Dogs* as both `500` (1992 feature) and `443129` (1991 short), and *From Dusk Till Dawn* as `755` and `1623134`. Both are real upstream records. They are not deduplicated, because collapsing by title would silently drop a genuine credit.
@@ -249,6 +254,7 @@ What is emitted:
 | `chat <model>`, `orchestrate_tools`, `execute_tool <name>` spans | framework, free | inspecting a single turn; `execute_tool` carries `ActivityStatusCode.Error` when a tool throws |
 | `gen_ai.client.token.usage`, `gen_ai.client.operation.duration` | framework, free | token totals and model latency — unsampled |
 | `gen_ai.client.tool.duration` / `.invocations` | `InstrumentedAIFunction` | per-tool latency and failure rate, dimensioned by tool name + outcome |
+| `MovieTracker.Backend.ToolCalls` log category | `InstrumentedAIFunction` | **which tool the model chose and what it passed** — the only way to debug tool selection |
 | `chat.turn.tool_calls`, `chat.context.retained_ratio` | `Function.cs` | is the iteration cap biting; is compaction still saving anything |
 | `gen_ai.usage.cost_usd` | `Telemetry.RecordCost` | spend — **only if** the price keys below are configured |
 
@@ -266,5 +272,14 @@ Two optional configuration keys, neither provisioned by Bicep:
 |---|---|
 | `Telemetry:Enable-Sensitive-Data` | Defaults to **true**, which is the long-standing behaviour: prompts and completions appear in traces. Set `false` to stop sending user questions and model answers to App Insights. |
 | `AzureOpenAi:Price-Input-Per-1M`, `-Output-`, `-Cached-Input-` | Enables `gen_ai.usage.cost_usd`. Deliberately has **no defaults** — a hardcoded rate that drifts produces a confident, wrong cost dashboard. Cached input is charged at its own rate and subtracted from the input count, which matters here because ~80% of input tokens are cache reads. |
+
+**Debugging a wrong answer starts with `MovieTracker.Backend.ToolCalls`.** Metrics tell you `DiscoverMovies` ran twice; only this tells you one ran with a cast filter and the other with a crew filter, which is the difference between right and wrong. The framework's `execute_tool` spans carry arguments too but are sampled away, so they cannot be relied on. Nearly every tool-selection bug found so far was invisible until the arguments were logged — `job=Actor` returning nothing, a raw `"show me the trailer for that one"` reaching a tool that cannot see the conversation, a runtime constraint the model passed correctly that TMDb then ignored. It is gated on `Telemetry:Enable-Sensitive-Data` because arguments contain user-supplied names and titles:
+
+```kusto
+traces | where timestamp > ago(30m)
+| extend cat = tostring(customDimensions.CategoryName)
+| where cat == 'MovieTracker.Backend.ToolCalls'
+| project timestamp, message | order by timestamp asc
+```
 
 Worker logs do not appear in `func start` console output; read them in App Insights. Custom metrics land in the `customMetrics` table, but to be *alertable* in Metrics explorer they are published under the hardcoded namespace `azure.applicationinsights` scoped to the Application Insights resource, not the linked Log Analytics workspace — and a newly emitted metric can take 10–15 minutes to appear in metric definitions. Keep metric dimensions to low-arity values (tool name, outcome, model); Azure Monitor caps a metric at 5,000 time series per 24h and replaces all dimension values with `Maximum values reached` past that, so chat ids and movie ids belong on spans, never on metrics.

@@ -27,6 +27,14 @@ namespace MovieTracker.Backend.Prompts
         private const int MaxPersonCredits = 25;
 
         /// <summary>
+        /// How many credits to look up genres for when a genre filter is supplied. The filter has to run
+        /// before the cap - filtering the top 25 by popularity would miss a qualifying film that sits at
+        /// 30 - so the candidate pool is widened first. Only paid when genreIds is actually passed, and
+        /// still bounded: a director's whole filmography fits comfortably inside this.
+        /// </summary>
+        private const int MaxGenreFilterLookups = 60;
+
+        /// <summary>
         /// Resolves TMDb movie ids to IMDb ids, concurrently, bounded by
         /// <see cref="MaxConcurrentTmdbCalls"/>.
         /// <para>
@@ -64,6 +72,51 @@ namespace MovieTracker.Backend.Prompts
             }));
 
             return new Dictionary<int, string>(resolved);
+        }
+
+        /// <summary>What a per-movie detail lookup contributes beyond the credit itself.</summary>
+        private sealed record MovieFacts(string ImdbId, IReadOnlyList<int> GenreIds, IReadOnlyList<string> GenreNames);
+
+        /// <summary>
+        /// Like <see cref="ResolveImdbIdsAsync"/> but fetches the whole movie, because TMDb's person
+        /// credits carry no genre at all on crew entries - <c>MovieJob</c> has Title, Job and dates and
+        /// nothing else, so "sci-fi films X directed" cannot be answered from the credits list alone.
+        /// <para>
+        /// This is the same <i>number</i> of round trips as resolving external ids: one per movie either
+        /// way, bounded by <see cref="MaxConcurrentTmdbCalls"/>. GetMovieAsync just returns more from
+        /// each of them, including the ImdbId that lookup existed for. The lighter external-ids path is
+        /// kept for search and discover, which need no genres.
+        /// </para>
+        /// </summary>
+        private async Task<Dictionary<int, MovieFacts>> ResolveMovieFactsAsync(IEnumerable<int> movieIds)
+        {
+            var resolved = new ConcurrentDictionary<int, MovieFacts>();
+            using var throttle = new SemaphoreSlim(MaxConcurrentTmdbCalls);
+
+            await Task.WhenAll(movieIds.Distinct().Select(async movieId =>
+            {
+                await throttle.WaitAsync();
+                try
+                {
+                    var movie = await client.GetMovieAsync(movieId);
+                    resolved[movieId] = new MovieFacts(
+                        movie.ImdbId ?? "",
+                        [.. movie.Genres?.Select(genre => genre.Id) ?? []],
+                        [.. movie.Genres?.Select(genre => genre.Name).Where(name => name is not null) ?? []]);
+                }
+                catch
+                {
+                    // A movie we cannot describe still belongs in the list under its own title; it just
+                    // cannot participate in genre filtering.
+                    resolved[movieId] = new MovieFacts("", [], []);
+                }
+                finally
+                {
+                    throttle.Release();
+                }
+            }));
+
+            return new Dictionary<int, MovieFacts>(resolved);
         }
 
         /// <summary>
@@ -202,14 +255,19 @@ namespace MovieTracker.Backend.Prompts
                      "each film. This is the right tool for 'what did X direct', 'what did X write' and " +
                      "'what has X been in', because it is the only one that can tell a directing credit " +
                      "from a writing or producing one - pass job='Director' for 'directed by'. Prefer " +
-                     "this over DiscoverMovies(crewIds:) for any question about one person's own work.")]
-        [return: Description("JSON with the person's credits: MovieId, MovieName, ReleaseDate, ImdbId, and either Character (acting) or Job")]
+                     "this over DiscoverMovies(crewIds:) for any question about one person's own work. " +
+                     "For 'sci-fi films X directed', pass genreIds as well and let this filter them; the " +
+                     "returned credits also carry Genres so you can narrow further yourself.")]
+        [return: Description("JSON with the person's credits: MovieId, MovieName, ReleaseDate, ImdbId, Genres, and either Character (acting) or Job")]
         public async Task<string> GetPersonMovieCredits(
             [Description("The TMDb PersonId, as returned by SearchForPeople")] string personId,
             [Description("Optional: keep only credits with this exact job, e.g. 'Director', 'Screenplay', " +
                          "'Producer'. Use 'Director' for 'directed by'. Omit for acting roles plus all crew work.")] string? job = null,
             [Description("Optional: only films released in or after this year (YYYY)")] string? fromYear = null,
-            [Description("Optional: only films released in or before this year (YYYY)")] string? toYear = null)
+            [Description("Optional: only films released in or before this year (YYYY)")] string? toYear = null,
+            [Description("Optional: keep only films in these genres, as comma-separated genre ids from " +
+                         "GetGenresList. Use this for 'sci-fi films X directed' rather than filtering the " +
+                         "results yourself - a person's credits do not otherwise carry genres.")] string? genreIds = null)
         {
             if (!TryGetPersonId(personId, out var tmdbPersonId, out var idError)) return idError;
 
@@ -266,9 +324,15 @@ namespace MovieTracker.Backend.Prompts
                 .ThenByDescending(credit => credit.Date)
                 .ToList();
 
-            var capped = all.Take(MaxPersonCredits).ToList();
+            var wantGenres = string.IsNullOrEmpty(genreIds) ? [] : ParseIdList(genreIds);
+            var filterByGenre = wantGenres.Count > 0;
 
-            // Resolve the IMDb ids here rather than telling the model to go and fetch them.
+            // Genre filtering has to happen before the cap, so widen the candidate pool when one is
+            // asked for - filtering the top 25 by popularity would silently miss a qualifying film
+            // sitting at position 30.
+            var candidates = all.Take(filterByGenre ? MaxGenreFilterLookups : MaxPersonCredits).ToList();
+
+            // Resolve details here rather than telling the model to go and fetch them.
             //
             // The first version of this method omitted ImdbId and pointed the model at DescribeMovie,
             // reasoning that skipping the fan-out was cheaper. Measured on the deployed app, it was the
@@ -276,29 +340,43 @@ namespace MovieTracker.Backend.Prompts
             // went from a max of 3 to a max of 10 against a cap of 12. The N+1 had not gone away, it had
             // moved from HTTP round trips into *model* iterations - roughly 1s each instead of 40ms, and
             // charged against the iteration budget, where running out truncates the answer.
-            var imdbIds = await ResolveImdbIdsAsync(
-                capped.Select(credit => int.TryParse(credit.MovieId, out var id) ? id : 0).Where(id => id > 0));
+            var facts = await ResolveMovieFactsAsync(
+                candidates.Select(credit => int.TryParse(credit.MovieId, out var id) ? id : 0).Where(id => id > 0));
 
-            var shown = capped.Select(credit => new
+            static MovieFacts FactsFor(Dictionary<int, MovieFacts> lookup, string movieId) =>
+                int.TryParse(movieId, out var id) && lookup.TryGetValue(id, out var found)
+                    ? found
+                    : new MovieFacts("", [], []);
+
+            var matching = filterByGenre
+                ? candidates.Where(credit => FactsFor(facts, credit.MovieId).GenreIds.Intersect(wantGenres).Any()).ToList()
+                : candidates;
+
+            var shown = matching.Take(MaxPersonCredits).Select(credit => new
             {
                 credit.MovieId,
                 credit.MovieName,
                 credit.ReleaseDate,
                 credit.Credit,
-                ImdbId = int.TryParse(credit.MovieId, out var id) && imdbIds.TryGetValue(id, out var imdb) ? imdb : "",
+                FactsFor(facts, credit.MovieId).ImdbId,
+                // Carried even when no filter was applied: it lets the model narrow the list itself for
+                // anything the genre ids cannot express ("his war films", "something funny").
+                Genres = FactsFor(facts, credit.MovieId).GenreNames,
             }).ToList();
 
             return JsonSerializer.Serialize(new
             {
                 PersonId = personId,
                 JobFilter = filterByJob ? wantJob : "(none - acting and all crew credits)",
-                TotalMatching = all.Count,
+                GenreFilter = filterByGenre ? genreIds : "(none)",
+                TotalCredits = all.Count,
+                TotalMatching = matching.Count,
                 Returned = shown.Count,
                 Credits = shown,
                 // Say so rather than silently truncating, so the model does not present a capped list
                 // as a complete filmography.
-                Note = all.Count > shown.Count
-                    ? $"Showing {shown.Count} of {all.Count} matching credits, best known first."
+                Note = matching.Count > shown.Count
+                    ? $"Showing {shown.Count} of {matching.Count} matching credits, best known first."
                     : "Complete list for this filter.",
                 Hint = "ImdbId is included - pass it straight to GetMovieRating or CompareMovieRatings. "
                      + "No need to call DescribeMovie first."

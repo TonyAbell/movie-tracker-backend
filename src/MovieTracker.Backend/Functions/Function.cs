@@ -408,6 +408,9 @@ namespace MovieTracker.Backend.Functions
                       the PersonId, and pass job="Director" for directing. It is the only tool that knows
                       which job someone did on a film - a plain crew filter also matches writing,
                       producing, even a "Thanks" credit, and cast filters miss directors entirely.
+                    - If the question also names a genre ("sci-fi films X directed"), pass genreIds to
+                      GetPersonMovieCredits too. Do not ask for the whole filmography and filter it
+                      yourself: that returns every film they made and costs a lookup per title.
                     - Use DiscoverMovies castIds/crewIds when you need to combine a person with other
                       filters (genre, dates, rating); use GetPersonMovieCredits when the question is
                       about one person's own work.
